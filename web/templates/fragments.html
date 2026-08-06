@@ -1,0 +1,141 @@
+{{/*
+  htmx fragments. Each is returned on its own by a /ui/* handler and is also
+  used inline by index.html for the first paint, so the page never has an empty
+  frame waiting on a request.
+*/}}
+
+{{/* Everything that is per-machine: swapped wholesale when the host changes. */}}
+{{define "host-panel"}}
+<div class="full" id="host-panel">
+  <label for="dir">Directory</label>
+  <div class="dirrow">
+    <input id="dir" name="dir" list="recents-list" value="{{.DefaultDir}}"
+           placeholder="e.g. /Users/you/code/project  or  D:\dev\project" autocomplete="off">
+    <button type="button" class="ghost"
+            hx-get="/ui/browse" hx-include="#host, #dir"
+            hx-target="#browser" hx-swap="innerHTML">Browse…</button>
+  </div>
+
+  <datalist id="recents-list">
+    {{range .Recents}}<option value="{{.}}"></option>{{end}}
+  </datalist>
+
+  {{if .Recents}}
+    <select class="recent-select" onchange="pickRecent(this)">
+      <option value="">Recent directories…</option>
+      {{range .Recents}}<option value="{{.}}" title="{{.}}">{{.}}</option>{{end}}
+    </select>
+  {{end}}
+
+  <div class="shellrow">
+    <label for="shell">Shell</label>
+    <select id="shell" name="shell">
+      {{if .Shells}}
+        {{range .Shells}}<option value="{{.ID}}">{{.Label}}</option>{{end}}
+      {{else}}
+        <option value="">no shells detected</option>
+      {{end}}
+    </select>
+  </div>
+
+  {{/* hx-target/hx-swap are inherited by every control the browser fragment
+       renders, so navigation just re-fills this container. */}}
+  <div id="browser" class="browser" hx-target="#browser" hx-swap="innerHTML"></div>
+</div>
+{{end}}
+
+{{/* Server-side folder picker. */}}
+{{define "browser"}}
+<div class="bar">
+  {{if .Parent}}
+    <button type="button" class="chip" hx-get="/ui/browse?path={{.Parent}}&node={{.Node}}">⬆ Up</button>
+  {{end}}
+  <button type="button" class="chip" hx-get="/ui/browse?path={{.Home}}&node={{.Node}}">🏠 Home</button>
+  {{range .Drives}}
+    <button type="button" class="chip" hx-get="/ui/browse?path={{.}}&node={{$.Node}}">{{.}}</button>
+  {{end}}
+</div>
+<div class="bar"><span class="cur" id="browser-path">{{.Path}}</span></div>
+<div class="list">
+  {{range .Dirs}}
+    <button type="button" class="item" hx-get="/ui/browse?path={{.Path}}&node={{$.Node}}">📁 {{.Name}}</button>
+  {{else}}
+    <div class="note">{{with .Error}}{{.}}{{else}}(no subfolders here){{end}}</div>
+  {{end}}
+</div>
+{{if and .Error .Dirs}}<div class="note err">{{.Error}}</div>{{end}}
+
+{{if .MkDir}}
+  <div class="foot">
+    <input id="foldername" name="foldername" placeholder="new folder name" autocomplete="off">
+    <input type="hidden" id="mk-path" name="path" value="{{.Path}}">
+    <input type="hidden" id="mk-node" name="node" value="{{.Node}}">
+    <button type="button"
+            hx-post="/ui/mkdir"
+            hx-include="#foldername, #mk-path, #mk-node">Create</button>
+    <button type="button" class="ghost" hx-get="/ui/browse?path={{.Path}}&node={{.Node}}">Cancel</button>
+  </div>
+{{else}}
+  <div class="foot">
+    <span class="footleft">
+      <button type="button" class="ghost" onclick="closeBrowser()">Close</button>
+      <button type="button" class="ghost" hx-get="/ui/browse?path={{.Path}}&node={{.Node}}&mkdir=1">＋ New folder…</button>
+    </span>
+    <button type="button" onclick="useFolder()">Use this folder</button>
+  </div>
+{{end}}
+{{end}}
+
+{{/* The ring-wide session table. */}}
+{{define "sessions"}}
+{{if .Sessions}}
+<table>
+  <thead>
+    <tr>
+      <th>Name</th>
+      {{if .MultiNode}}<th>Host</th>{{end}}
+      <th>Directory</th><th>Shell</th><th>Model</th><th>PID</th><th>Uptime</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {{range .Sessions}}
+    <tr>
+      <td><span class="dot {{.Status}}"></span>{{.Name}}</td>
+      {{if $.MultiNode}}<td class="muted">{{with .NodeLabel}}{{.}}{{else}}—{{end}}</td>{{end}}
+      <td><code>{{.Dir}}</code></td>
+      <td>{{.ShellLabel}}</td>
+      <td class="muted">{{with .ModelLabel}}{{.}}{{else}}—{{end}}</td>
+      <td class="muted">{{.PID}}</td>
+      <td class="muted">{{uptime .StartedAt .Status}}</td>
+      <td>
+        <button type="button" class="ghost"
+                hx-delete="/ui/sessions/{{.ID}}?node={{.Node}}"
+                hx-target="#sessions" hx-swap="innerHTML">
+          {{if eq .Status "running"}}Kill{{else}}Remove{{end}}
+        </button>
+      </td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<div class="empty">No sessions yet. Launch one above.</div>
+{{end}}
+{{end}}
+
+{{/* Table plus an out-of-band update of the error line. */}}
+{{define "sessions-with-error"}}
+{{template "sessions" .}}
+<div id="err" class="err" hx-swap-oob="true">{{.Err}}</div>
+{{end}}
+
+{{/* After a successful launch: table, cleared error, refreshed recents, and an
+     emptied name field so the next launch starts clean. */}}
+{{define "sessions-after-launch"}}
+{{template "sessions" .}}
+<div id="err" class="err" hx-swap-oob="true"></div>
+<datalist id="recents-list" hx-swap-oob="true">
+  {{range .Recents}}<option value="{{.}}"></option>{{end}}
+</datalist>
+<input id="sname" name="name" placeholder="auto from folder" autocomplete="off" hx-swap-oob="true">
+{{end}}

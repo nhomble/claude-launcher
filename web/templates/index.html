@@ -1,0 +1,70 @@
+{{define "index.html"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>claude-launcher</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <nav class="nav">
+    <a class="brand" href="/">claude-launcher</a>
+    <a href="https://claude.ai/code" target="_blank" rel="noopener">claude.ai/code ↗</a>
+  </nav>
+
+  <h1>claude-launcher</h1>
+  <p class="sub">Spawn remote-controlled Claude Code sessions in a directory + shell of your choice. Drive them from <a href="https://claude.ai/code" target="_blank" rel="noopener">claude.ai/code</a> or the mobile <strong>Code</strong> tab.</p>
+
+  <div class="banner">
+    Each launch runs <code>claude --model &lt;model&gt; --remote-control "&lt;name&gt;"</code> through the chosen shell (so its profile/env loads), in a windowless pseudo-terminal.
+    This host must be logged into claude.ai (<code>claude</code>, not an API key) for sessions to appear.
+  </div>
+
+  <h2>New session</h2>
+  <div class="form" id="new-session">
+    <div class="full" {{if not .MultiNode}}hidden{{end}}>
+      <label for="host">Host</label>
+      <select id="host" name="node"
+              hx-get="/ui/host" hx-target="#host-panel" hx-swap="outerHTML">
+        {{range .Nodes}}
+          <option value="{{.ID}}"{{if .Self}} selected{{end}}{{if and (not .Online) (not .Self)}} disabled{{end}}>
+            {{.Label}}{{with .Platform}} · {{.}}{{end}}{{if and (not .Online) (not .Self)}} (offline){{end}}
+          </option>
+        {{end}}
+      </select>
+    </div>
+
+    {{template "host-panel" .}}
+
+    <div>
+      <label for="model">Model</label>
+      <select id="model" name="model">
+        {{range .Models}}<option value="{{.ID}}"{{if .Default}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </div>
+    <div>
+      <label for="sname">Name <span class="muted">(optional)</span></label>
+      <input id="sname" name="name" placeholder="auto from folder" autocomplete="off">
+    </div>
+    <div>
+      <button id="launch"
+              hx-post="/ui/sessions"
+              hx-include="#host, #dir, #shell, #model, #sname"
+              hx-target="#sessions" hx-swap="innerHTML">Launch</button>
+    </div>
+    <div class="full err" id="err"></div>
+  </div>
+
+  <h2>Sessions</h2>
+  <div id="sessions" hx-get="/ui/sessions" hx-trigger="every 4s" hx-target="this" hx-swap="innerHTML">
+    {{template "sessions" .}}
+  </div>
+
+  <footer>
+    Tailnet-only, no auth — anyone who can reach this page can spawn shells on this host.
+  </footer>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>{{end}}

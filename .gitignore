@@ -1,0 +1,5 @@
+/claude-launcher
+/dist/
+/data/
+.env
+.DS_Store
