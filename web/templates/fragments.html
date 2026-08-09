@@ -48,17 +48,17 @@
 {{define "browser"}}
 <div class="bar">
   {{if .Parent}}
-    <button type="button" class="chip" hx-get="/ui/browse?path={{.Parent}}&node={{.Node}}">⬆ Up</button>
+    <button type="button" class="chip" hx-get="{{qurl "/ui/browse" "path" .Parent "node" .Node}}">⬆ Up</button>
   {{end}}
-  <button type="button" class="chip" hx-get="/ui/browse?path={{.Home}}&node={{.Node}}">🏠 Home</button>
+  <button type="button" class="chip" hx-get="{{qurl "/ui/browse" "path" .Home "node" .Node}}">🏠 Home</button>
   {{range .Drives}}
-    <button type="button" class="chip" hx-get="/ui/browse?path={{.}}&node={{$.Node}}">{{.}}</button>
+    <button type="button" class="chip" hx-get="{{qurl "/ui/browse" "path" . "node" $.Node}}">{{.}}</button>
   {{end}}
 </div>
 <div class="bar"><span class="cur" id="browser-path">{{.Path}}</span></div>
 <div class="list">
   {{range .Dirs}}
-    <button type="button" class="item" hx-get="/ui/browse?path={{.Path}}&node={{$.Node}}">📁 {{.Name}}</button>
+    <button type="button" class="item" hx-get="{{qurl "/ui/browse" "path" .Path "node" $.Node}}">📁 {{.Name}}</button>
   {{else}}
     <div class="note">{{with .Error}}{{.}}{{else}}(no subfolders here){{end}}</div>
   {{end}}
@@ -73,13 +73,13 @@
     <button type="button"
             hx-post="/ui/mkdir"
             hx-include="#foldername, #mk-path, #mk-node">Create</button>
-    <button type="button" class="ghost" hx-get="/ui/browse?path={{.Path}}&node={{.Node}}">Cancel</button>
+    <button type="button" class="ghost" hx-get="{{qurl "/ui/browse" "path" .Path "node" .Node}}">Cancel</button>
   </div>
 {{else}}
   <div class="foot">
     <span class="footleft">
       <button type="button" class="ghost" onclick="closeBrowser()">Close</button>
-      <button type="button" class="ghost" hx-get="/ui/browse?path={{.Path}}&node={{.Node}}&mkdir=1">＋ New folder…</button>
+      <button type="button" class="ghost" hx-get="{{qurl "/ui/browse" "path" .Path "node" .Node "mkdir" "1"}}">＋ New folder…</button>
     </span>
     <button type="button" onclick="useFolder()">Use this folder</button>
   </div>
@@ -109,7 +109,7 @@
       <td class="muted">{{uptime .StartedAt .Status}}</td>
       <td>
         <button type="button" class="ghost"
-                hx-delete="/ui/sessions/{{.ID}}?node={{.Node}}"
+                hx-delete="{{qurl (printf "/ui/sessions/%s" .ID) "node" .Node}}"
                 hx-target="#sessions" hx-swap="innerHTML">
           {{if eq .Status "running"}}Kill{{else}}Remove{{end}}
         </button>

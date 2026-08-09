@@ -13,6 +13,7 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +43,7 @@ type Server struct {
 func New(cfg config.Config, ring *nodes.Ring, mgr *sessions.Manager, store *catalog.Store, reg *shells.Registry) (*Server, error) {
 	tpl, err := template.New("").Funcs(template.FuncMap{
 		"uptime": uptime,
+		"qurl":   queryURL,
 	}).ParseFS(web.Templates, "templates/*.html")
 	if err != nil {
 		return nil, err
@@ -397,6 +399,25 @@ func errBody(msg string) map[string]string { return map[string]string{"error": m
 
 func decodeJSON(r *http.Request, out any) error {
 	return json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20)).Decode(out)
+}
+
+// queryURL builds "base?k=v&k=v" with every value percent-encoded, skipping
+// empty ones. Templates must not interpolate values into a URL by hand:
+// html/template does not recognise htmx's hx-get/hx-delete as URL attributes,
+// so it HTML-escapes but never URL-escapes them — and a directory named "R&D"
+// or "c++ stuff" would then split the query string or decode "+" as a space,
+// sending the folder browser somewhere else entirely.
+func queryURL(base string, kv ...string) string {
+	q := url.Values{}
+	for i := 0; i+1 < len(kv); i += 2 {
+		if kv[i+1] != "" {
+			q.Set(kv[i], kv[i+1])
+		}
+	}
+	if len(q) == 0 {
+		return base
+	}
+	return base + "?" + q.Encode()
 }
 
 // uptime renders how long a session has been up, from its epoch-ms start.

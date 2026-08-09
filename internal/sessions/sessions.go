@@ -36,6 +36,12 @@ const (
 	logCap     = 256 * 1024 // keep the useful startup/connection output, cap growth
 	tailBytes  = 16 * 1024
 	promptWind = 4096 // rolling ANSI-stripped window scanned for startup gates
+
+	// How long the startup gates stay armed. Whichever comes first: remote
+	// control connecting, every known gate answered, this many bytes, or this
+	// long. After that the scanner shuts off for good.
+	gateWindow      = 90 * time.Second
+	gateWindowBytes = 64 * 1024
 )
 
 type Session struct {
@@ -85,6 +91,10 @@ var (
 		// the plain line-based renderer the launcher relies on.
 		{"fullscreen-renderer", regexp.MustCompile(`(?i)try the new fullscreen renderer`), "\x1b"},
 	}
+
+	// Remote control is up: onboarding is definitively over, so the gates can
+	// close even if some never fired.
+	gatesDone = regexp.MustCompile(`(?i)remote.?control\s*is\s*active|/code/session_`)
 )
 
 type live struct {
@@ -97,6 +107,11 @@ type live struct {
 	exited   bool //
 	head     []byte
 	answered map[string]bool
+	gateShut bool // startup window is over; stop scanning for gates
+
+	// Closed by pump() when the PTY is drained, so reap() can write the exit
+	// line and close the log knowing nothing else will touch them.
+	pumped chan struct{}
 }
 
 type Manager struct {
@@ -119,12 +134,19 @@ func NewManager(cfg config.Config, store *catalog.Store, reg *shells.Registry) *
 }
 
 func (m *Manager) List() []Session {
+	// Collect the pointers under m.mu, snapshot after releasing it: taking
+	// l.mu while holding m.mu would let one slow session block every caller.
 	m.mu.RLock()
-	out := make([]Session, 0, len(m.items))
+	items := make([]*live, 0, len(m.items))
 	for _, l := range m.items {
-		out = append(out, l.snapshot())
+		items = append(items, l)
 	}
 	m.mu.RUnlock()
+
+	out := make([]Session, 0, len(items))
+	for _, l := range items {
+		out = append(out, l.snapshot())
+	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt > out[j].StartedAt })
 	return out
@@ -318,6 +340,7 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 		cmd:      cmd,
 		log:      lf,
 		answered: map[string]bool{},
+		pumped:   make(chan struct{}),
 	}
 
 	m.mu.Lock()
@@ -337,6 +360,7 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 // known interactive startup gates.
 func (l *live) pump() {
 	buf := make([]byte, 8192)
+	defer close(l.pumped)
 	for {
 		n, err := l.pty.Read(buf)
 		if n > 0 {
@@ -348,39 +372,95 @@ func (l *live) pump() {
 	}
 }
 
+// onData handles one chunk of PTY output. All I/O happens OUTSIDE l.mu: the log
+// can sit on a slow or full disk, and blocking there while holding the lock
+// would wedge Manager.List() and, through it, every Spawn/Remove/Shutdown.
+// Ordering is safe without the lock because pump() is the only writer to the
+// log while a session runs, and reap() waits for pump() before touching it.
 func (l *live) onData(data []byte) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.logged < logCap {
+	write := l.logged < logCap
+	if write {
 		l.logged += len(data)
-		l.log.Write(data)
-		if l.logged >= logCap {
-			l.log.WriteString("\n…[log capped]…\n")
-		}
 	}
+	capped := write && l.logged >= logCap
+	gates := l.scanGatesLocked(data)
+	l.mu.Unlock()
 
-	// Scan a small rolling ANSI-stripped window. Each gate fires at most once
-	// and only when its prompt actually shows, so a session that never hits a
-	// given gate (e.g. an already-trusted dir) never receives a stray keypress.
-	if len(l.answered) < len(startupPrompts) {
-		l.head = append(l.head, stripANSI.ReplaceAll(data, nil)...)
-		if len(l.head) > promptWind {
-			l.head = l.head[len(l.head)-promptWind:]
-		}
-		for _, p := range startupPrompts {
-			if !l.answered[p.ID] && p.Match.Match(l.head) {
-				l.answered[p.ID] = true
-				if _, err := l.pty.Write([]byte(p.Send)); err == nil {
-					fmt.Fprintf(l.log, "\n[claude-launcher: auto-answered %s prompt]\n", p.ID)
-					log.Printf("session %s auto-answered the %s prompt", l.session.ID, p.ID)
-				}
-			}
+	if write {
+		l.log.Write(data)
+	}
+	if capped {
+		l.log.WriteString("\n…[log capped]…\n")
+	}
+	for _, p := range gates {
+		// One keystroke; it cannot realistically fill the PTY's input buffer,
+		// which matters because pump() (this goroutine) is its only reader.
+		if _, err := l.pty.Write([]byte(p.send)); err == nil {
+			fmt.Fprintf(l.log, "\n[claude-launcher: auto-answered %s prompt]\n", p.id)
+			log.Printf("session %s auto-answered the %s prompt", l.session.ID, p.id)
 		}
 	}
 }
 
+type gateHit struct{ id, send string }
+
+// scanGatesLocked matches the startup gates against a rolling ANSI-stripped
+// window and returns the ones to answer. Caller holds l.mu and does the writing.
+//
+// The window is only scanned during STARTUP — see gateWindow. Once it closes we
+// stop looking, which is the whole point: these patterns are ordinary English
+// and a long-lived session will eventually print something that matches (a
+// session reading this repo's own README would), and answering then would put a
+// stray Enter on the stdin of a live session, confirming whatever prompt the TUI
+// happened to be showing.
+func (l *live) scanGatesLocked(data []byte) []gateHit {
+	if l.gateShut {
+		return nil
+	}
+	switch {
+	case len(l.answered) >= len(startupPrompts):
+		// Every known gate answered — nothing left to wait for.
+	case l.logged > gateWindowBytes:
+		// Past any plausible startup banner.
+	case time.Since(time.UnixMilli(l.session.StartedAt)) > gateWindow:
+		// Took too long to connect; whatever is happening isn't onboarding.
+	default:
+		l.head = append(l.head, stripANSI.ReplaceAll(data, nil)...)
+		if len(l.head) > promptWind {
+			l.head = l.head[len(l.head)-promptWind:]
+		}
+		var hits []gateHit
+		for _, p := range startupPrompts {
+			if !l.answered[p.ID] && p.Match.Match(l.head) {
+				l.answered[p.ID] = true
+				hits = append(hits, gateHit{p.ID, p.Send})
+			}
+		}
+		// Remote control coming up is the positive signal that startup is over.
+		if gatesDone.Match(l.head) {
+			l.shutGatesLocked()
+		}
+		return hits
+	}
+
+	l.shutGatesLocked()
+	return nil
+}
+
+func (l *live) shutGatesLocked() {
+	l.gateShut = true
+	l.head = nil // the scan window is dead weight from here on
+}
+
 // reap waits for the shell to exit and closes out the session's resources.
+//
+// Order matters. The PTY master can still hold unread bytes after the child is
+// gone, and pump() runs on its own goroutine: closing the log first would drop
+// the last output before an exit — exactly the lines you need when a launch
+// fails, silently, since a write to a closed *os.File just returns an error
+// nobody reads. So: close the PTY (which ends pump's blocking read), wait for
+// pump to finish, and only then write the exit line and close the log.
 func (l *live) reap() {
 	err := l.cmd.Wait()
 
@@ -392,13 +472,15 @@ func (l *live) reap() {
 	} else if err != nil {
 		code = -1
 	}
+	l.mu.Unlock()
+
+	l.pty.Close()
+	<-l.pumped
+
 	fmt.Fprintf(l.log, "\n[exited code=%d]\n", code)
 	log.Printf("session %s %q exited code=%d after %s",
 		l.session.ID, l.session.Name, code, uptime(l.session.StartedAt))
 	l.log.Close()
-	l.mu.Unlock()
-
-	l.pty.Close()
 }
 
 // Remove kills the session (if running) and drops it from the store.

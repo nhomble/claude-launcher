@@ -66,10 +66,11 @@ type file struct {
 type Store struct {
 	path string // "" when running on the built-in defaults
 
-	mu    sync.RWMutex
-	cur   file
-	gen   uint64 // bumped on every successful (re)load; caches key off this
-	stamp string // mtime+size of the loaded file, "" for defaults
+	mu     sync.RWMutex
+	cur    file
+	gen    uint64 // bumped on every successful (re)load; caches key off this
+	stamp  string // mtime+size of the loaded file, "" for defaults
+	failed string // stamp of the last file we could not load; log-once token
 }
 
 // New builds a store. path may be empty, in which case only the built-in
@@ -202,24 +203,40 @@ func (s *Store) reloadIfChanged() {
 	if now == s.stamp { // another goroutine got there first
 		return
 	}
-	// Record the stamp even on failure, so a broken file is reported once
-	// rather than on every request until it is fixed.
-	s.stamp = now
+
+	// A FAILED read must not record `now` as the good stamp. An editor that
+	// writes non-atomically (truncate-then-write, a redirect, an rsync in
+	// flight) can be caught mid-write: we would stat the final size, read a
+	// half-written file, fail to parse — and, having stamped ourselves, never
+	// look at the file again. So failures record a separate token, used only to
+	// keep the log to one line per distinct broken state, and leave s.stamp
+	// alone so the next request retries.
+	fail := func(format string, args ...any) {
+		if now != s.failed {
+			s.failed = now
+			log.Printf(format, args...)
+		}
+	}
 
 	if now == "" {
-		log.Printf("catalog: %s disappeared; keeping the last good config", s.path)
+		fail("catalog: %s disappeared; keeping the last good config", s.path)
 		return
 	}
 	b, err := os.ReadFile(s.path)
 	if err != nil {
-		log.Printf("catalog: cannot re-read %s (%v); keeping the last good config", s.path, err)
+		fail("catalog: cannot re-read %s (%v); keeping the last good config", s.path, err)
 		return
 	}
 	loaded, err := parse(b)
 	if err != nil {
-		log.Printf("catalog: %s is invalid (%v); keeping the last good config", s.path, err)
+		fail("catalog: %s is invalid (%v); keeping the last good config", s.path, err)
 		return
 	}
+	// Stamp from AFTER the successful read: if the file changed again while we
+	// were reading it, `now` is already stale and we want the next request to
+	// pick the newer content up.
+	s.stamp = stampOf(s.path)
+	s.failed = ""
 	s.cur = loaded
 	s.gen++
 	log.Printf("catalog: reloaded %s (%d models, %d shells)", s.path, len(loaded.Models), len(loaded.Shells))
