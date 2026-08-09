@@ -20,6 +20,12 @@ const (
 	fanoutTimeout = 5 * time.Second
 )
 
+// FanoutHeader marks a request as one node querying another during a
+// /api/sessions fan-out. A node that receives it answers with its OWN sessions
+// only, never fanning out again — otherwise two nodes that each list the other
+// as a follower would query each other forever.
+const FanoutHeader = "X-Claude-Launcher-Fanout"
+
 var client = &http.Client{Timeout: proxyTimeout}
 
 // proxy forwards the current request to a follower and copies its response back
@@ -72,8 +78,9 @@ func proxy(w http.ResponseWriter, r *http.Request, n nodes.Node) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-// getJSON fetches path from a follower and decodes it into out.
-func getJSON(n nodes.Node, path string, query url.Values, out any, timeout time.Duration) error {
+// getJSON fetches path from a follower and decodes it into out. headers are
+// applied to the outgoing request (see FanoutHeader).
+func getJSON(n nodes.Node, path string, query url.Values, out any, timeout time.Duration, headers ...[2]string) error {
 	u, err := url.Parse(n.URL)
 	if err != nil {
 		return err
@@ -81,8 +88,16 @@ func getJSON(n nodes.Node, path string, query url.Values, out any, timeout time.
 	u.Path = path
 	u.RawQuery = query.Encode()
 
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	for _, h := range headers {
+		req.Header.Set(h[0], h[1])
+	}
+
 	c := &http.Client{Timeout: timeout}
-	resp, err := c.Get(u.String())
+	resp, err := c.Do(req)
 	if err != nil {
 		return err
 	}

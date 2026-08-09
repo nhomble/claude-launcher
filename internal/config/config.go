@@ -26,6 +26,7 @@ type Config struct {
 	ClaudeBin     string // override when `claude` isn't on PATH for spawned shells
 	DefaultDir    string // pre-filled directory in the UI form
 	DataDir       string // session logs + recents.json (gitignored)
+	ConfigFile    string // explicit path to config.yaml; empty = search
 	Role          Role
 	NodeID        string // stable routing key, unique in the ring
 	NodeLabel     string // pretty name shown in the UI
@@ -55,6 +56,7 @@ func Load() Config {
 		ClaudeBin:     env("CLAUDE_BIN", "claude"),
 		DefaultDir:    env("CLAUDE_LAUNCHER_DEFAULT_DIR", ""),
 		DataDir:       dataDir,
+		ConfigFile:    env("CLAUDE_LAUNCHER_CONFIG", ""),
 		Role:          role,
 		NodeID:        env("CLAUDE_LAUNCHER_NODE_ID", "local"),
 		NodeLabel:     env("CLAUDE_LAUNCHER_NODE_LABEL", ""),

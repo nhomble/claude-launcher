@@ -16,19 +16,29 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nhomble/claude-launcher/internal/catalog"
 	"github.com/nhomble/claude-launcher/internal/config"
 	"github.com/nhomble/claude-launcher/internal/nodes"
 	"github.com/nhomble/claude-launcher/internal/server"
 	"github.com/nhomble/claude-launcher/internal/sessions"
+	"github.com/nhomble/claude-launcher/internal/shells"
 )
 
 // version is stamped at build time (see the Makefile).
 var version = "dev"
 
 func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "-v" || os.Args[1] == "--version") {
-		fmt.Println("claude-launcher", version)
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-v", "--version":
+			fmt.Println("claude-launcher", version)
+			return
+		// The built-in catalog, commented — `--dump-config > config.yaml` is how
+		// you start editing the model and shell lists.
+		case "--dump-config":
+			os.Stdout.Write(catalog.Defaults())
+			return
+		}
 	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "claude-launcher:", err)
@@ -44,8 +54,20 @@ func run() error {
 		return err
 	}
 
-	mgr := sessions.NewManager(cfg)
-	srv, err := server.New(cfg, ring, mgr)
+	// The catalog (models + shells) is config.yaml if there is one, else the
+	// built-in defaults. It reloads itself when the file changes.
+	catalogPath, err := catalog.FindConfig(cfg.ConfigFile)
+	if err != nil {
+		return err
+	}
+	catalogStore, err := catalog.New(catalogPath)
+	if err != nil {
+		return err
+	}
+	reg := shells.NewRegistry(catalogStore)
+
+	mgr := sessions.NewManager(cfg, catalogStore, reg)
+	srv, err := server.New(cfg, ring, mgr, catalogStore, reg)
 	if err != nil {
 		return err
 	}

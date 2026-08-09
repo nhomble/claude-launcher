@@ -15,9 +15,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -25,8 +27,8 @@ import (
 
 	xpty "github.com/aymanbagabas/go-pty"
 
+	"github.com/nhomble/claude-launcher/internal/catalog"
 	"github.com/nhomble/claude-launcher/internal/config"
-	"github.com/nhomble/claude-launcher/internal/models"
 	"github.com/nhomble/claude-launcher/internal/shells"
 )
 
@@ -98,17 +100,21 @@ type live struct {
 }
 
 type Manager struct {
-	mu     sync.RWMutex
-	items  map[string]*live
-	cfg    config.Config
-	logDir string
+	mu      sync.RWMutex
+	items   map[string]*live
+	cfg     config.Config
+	catalog *catalog.Store
+	shells  *shells.Registry
+	logDir  string
 }
 
-func NewManager(cfg config.Config) *Manager {
+func NewManager(cfg config.Config, store *catalog.Store, reg *shells.Registry) *Manager {
 	return &Manager{
-		items:  map[string]*live{},
-		cfg:    cfg,
-		logDir: filepath.Join(cfg.DataDir, "logs"),
+		items:   map[string]*live{},
+		cfg:     cfg,
+		catalog: store,
+		shells:  reg,
+		logDir:  filepath.Join(cfg.DataDir, "logs"),
 	}
 }
 
@@ -169,6 +175,53 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
+// Variables that identify a Claude Code session. If the launcher itself was
+// started from inside one (a terminal running `claude`, say), the whole set is
+// in its environment — and a session spawned with it inherited would believe it
+// is a CHILD of that session: transcript saving silently turns off, and it
+// reports the parent's session id. Strip them so every spawned session is its
+// own top-level session.
+var inheritedMarkers = []string{
+	"CLAUDECODE",
+	"CLAUDE_PID",
+	"CLAUDE_EFFORT",
+}
+
+// …plus everything under this prefix (CLAUDE_CODE_CHILD_SESSION,
+// CLAUDE_CODE_SESSION_ID, CLAUDE_CODE_BRIDGE_SESSION_ID, …).
+const markerPrefix = "CLAUDE_CODE_"
+
+var warnMarkers sync.Once
+
+// sessionEnv is the launcher's environment minus those markers. It returns the
+// names it dropped, which are noted in the session log — silently changing a
+// session's environment would be worse than the leak.
+func sessionEnv() (env []string, dropped []string) {
+	defer func() {
+		if len(dropped) > 0 {
+			warnMarkers.Do(func() {
+				log.Printf("this launcher runs inside a Claude Code session; stripping %s from spawned sessions "+
+					"(start it from a plain shell to avoid this)", strings.Join(dropped, " "))
+			})
+		}
+	}()
+
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(name, markerPrefix) || slices.Contains(inheritedMarkers, name) {
+			dropped = append(dropped, name)
+			continue
+		}
+		env = append(env, kv)
+	}
+	return env, dropped
+}
+
+// uptime renders how long a session ran, for the lifecycle log lines.
+func uptime(startedAt int64) string {
+	return time.Since(time.UnixMilli(startedAt)).Round(time.Second).String()
+}
+
 type SpawnOpts struct {
 	Dir   string `json:"dir"`
 	Shell string `json:"shell"`
@@ -185,7 +238,7 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 		return Session{}, fmt.Errorf("directory does not exist: %s", dir)
 	}
 
-	sh, ok := shells.Get(strings.TrimSpace(opts.Shell))
+	sh, ok := m.shells.Get(strings.TrimSpace(opts.Shell))
 	if !ok {
 		name := strings.TrimSpace(opts.Shell)
 		if name == "" {
@@ -194,7 +247,7 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 		return Session{}, fmt.Errorf("unknown or unavailable shell: %s", name)
 	}
 
-	model, err := models.Resolve(opts.Model)
+	model, err := m.catalog.ResolveModel(opts.Model)
 	if err != nil {
 		return Session{}, err
 	}
@@ -235,9 +288,13 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 		fmt.Fprintf(lf, "[claude-launcher: pty resize failed: %v]\n", err)
 	}
 
-	cmd := p.Command(sh.Bin, sh.Args(command)...)
+	cmd := p.Command(sh.Bin, sh.Argv(command)...)
 	cmd.Dir = dir
-	cmd.Env = os.Environ()
+	env, dropped := sessionEnv()
+	cmd.Env = env
+	if len(dropped) > 0 {
+		fmt.Fprintf(lf, "[claude-launcher: dropped inherited Claude Code markers: %s]\n", strings.Join(dropped, " "))
+	}
 	if err := cmd.Start(); err != nil {
 		p.Close()
 		lf.Close()
@@ -266,6 +323,9 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 	m.mu.Lock()
 	m.items[id] = l
 	m.mu.Unlock()
+
+	log.Printf("session %s %q started · %s · %s · %s · pid %d",
+		id, name, sh.ID, model.ID, dir, cmd.Process.Pid)
 
 	go l.pump()
 	go l.reap()
@@ -313,6 +373,7 @@ func (l *live) onData(data []byte) {
 				l.answered[p.ID] = true
 				if _, err := l.pty.Write([]byte(p.Send)); err == nil {
 					fmt.Fprintf(l.log, "\n[claude-launcher: auto-answered %s prompt]\n", p.ID)
+					log.Printf("session %s auto-answered the %s prompt", l.session.ID, p.ID)
 				}
 			}
 		}
@@ -332,6 +393,8 @@ func (l *live) reap() {
 		code = -1
 	}
 	fmt.Fprintf(l.log, "\n[exited code=%d]\n", code)
+	log.Printf("session %s %q exited code=%d after %s",
+		l.session.ID, l.session.Name, code, uptime(l.session.StartedAt))
 	l.log.Close()
 	l.mu.Unlock()
 
@@ -356,7 +419,10 @@ func (m *Manager) Remove(id string) bool {
 	if !exited && l.cmd.Process != nil {
 		// Kill the whole process group: the PTY runs a login shell which in
 		// turn exec'd `claude`, and killing only the shell would orphan it.
+		log.Printf("session %s %q killed after %s", id, l.session.Name, uptime(l.session.StartedAt))
 		killGroup(l.cmd.Process)
+	} else {
+		log.Printf("session %s %q removed (already stopped)", id, l.session.Name)
 	}
 	return true
 }

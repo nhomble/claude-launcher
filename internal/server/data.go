@@ -2,13 +2,13 @@ package server
 
 import (
 	"fmt"
+	"log"
 	"net/url"
 	"sync"
 
 	"github.com/nhomble/claude-launcher/internal/browse"
 	"github.com/nhomble/claude-launcher/internal/nodes"
 	"github.com/nhomble/claude-launcher/internal/sessions"
-	"github.com/nhomble/claude-launcher/internal/shells"
 )
 
 // Node-aware data access. Every per-host read/mutation goes through one of
@@ -22,8 +22,9 @@ type shellView struct {
 
 func (s *Server) shellsFor(n nodes.Node) ([]shellView, error) {
 	if n.Self {
-		out := make([]shellView, 0, len(shells.Available()))
-		for _, sh := range shells.Available() {
+		av := s.shells.Available()
+		out := make([]shellView, 0, len(av))
+		for _, sh := range av {
 			out = append(out, shellView{ID: sh.ID, Label: sh.Label})
 		}
 		return out, nil
@@ -81,14 +82,20 @@ func (s *Server) mkdirOn(n nodes.Node, parent, name string) (string, error) {
 func (s *Server) spawnOn(n nodes.Node, opts sessions.SpawnOpts) (sessions.Session, error) {
 	if n.Self {
 		sess, err := s.sessions.Spawn(opts)
-		if err == nil {
-			s.recents.Add(sess.Dir)
+		if err != nil {
+			log.Printf("launch refused: %v (dir=%q shell=%q model=%q)", err, opts.Dir, opts.Shell, opts.Model)
+			return sess, err
 		}
-		return sess, err
+		s.recents.Add(sess.Dir)
+		return sess, nil
 	}
 	var out sessions.Session
-	err := sendJSON(n, "POST", "/api/sessions", nil, opts, &out)
-	return out, err
+	if err := sendJSON(n, "POST", "/api/sessions", nil, opts, &out); err != nil {
+		log.Printf("launch on node %s failed: %v", n.ID, err)
+		return out, err
+	}
+	log.Printf("launched %s %q on node %s", out.ID, out.Name, n.ID)
+	return out, nil
 }
 
 func (s *Server) removeOn(n nodes.Node, id string) error {
@@ -104,8 +111,14 @@ func (s *Server) removeOn(n nodes.Node, id string) error {
 // allSessions is the one AGGREGATE read: the union of self plus every online
 // follower, each row tagged with its owning node. Offline followers are simply
 // omitted — never cached, never stalls the table.
-func (s *Server) allSessions() []sessions.Session {
+//
+// fannedOut says this request is itself a peer's fan-out, in which case we
+// answer with local sessions only (see FanoutHeader).
+func (s *Server) allSessions(fannedOut bool) []sessions.Session {
 	all := s.ring.All()
+	if fannedOut {
+		all = all[:1] // self only
+	}
 	rows := make([][]sessions.Session, len(all))
 
 	var wg sync.WaitGroup
@@ -123,7 +136,7 @@ func (s *Server) allSessions() []sessions.Session {
 		go func(i int, n nodes.Node) {
 			defer wg.Done()
 			var remote []sessions.Session
-			if err := getJSON(n, "/api/sessions", nil, &remote, fanoutTimeout); err != nil {
+			if err := getJSON(n, "/api/sessions", nil, &remote, fanoutTimeout, [2]string{FanoutHeader, "1"}); err != nil {
 				return
 			}
 			for j := range remote {

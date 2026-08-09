@@ -1,0 +1,103 @@
+# claude-launcher catalog — the model dropdown and the shells the launcher
+# knows how to run a session through.
+#
+# These are the built-in defaults, used when no config.yaml is found. A
+# config.yaml REPLACES this file wholesale, so you can drop entries you never
+# use. Start from a copy of the current defaults with:
+#
+#     claude-launcher --dump-config > config.yaml
+#
+# The file is re-read when it changes on disk — no restart, so editing it never
+# costs you a running session. A parse error keeps the last good version.
+
+# Offered in the UI's Model dropdown. Each id is passed to `claude --model <id>`
+# verbatim (and always quoted, since ids like `claude-opus-4-8[1m]` contain
+# shell-special brackets). Exactly one entry may set `default: true`; it is
+# pre-selected in the UI and used when a launch request omits a model. Without
+# one, the first entry wins.
+models:
+  - id: claude-opus-4-8[1m]
+    label: Opus 4.8 · 1M context
+    default: true
+  - id: claude-opus-4-8
+    label: Opus 4.8
+  - id: claude-sonnet-4-6
+    label: Sonnet 4.6
+  - id: claude-haiku-4-5-20251001
+    label: Haiku 4.5
+
+# Sessions are launched THROUGH a shell so the shell sources the user's
+# profile/rc (PATH, env, nvm, aliases) before exec'ing `claude`.
+#
+#   os:         posix | windows — only entries matching this host are offered.
+#   candidates: tried in order; a bare name is resolved on PATH, a path is
+#               checked for existence. The first hit wins; an entry whose
+#               candidates all miss is simply not offered on this host.
+#   quote:      character used to wrap a value (the model id, a session name
+#               containing spaces) inside the command string.
+#   args:       argv for the shell. Exactly one element must be the literal
+#               {{command}} placeholder; it is replaced by the `claude …`
+#               command line.
+#
+# Order matters: the first shell listed for this host is the UI's default.
+shells:
+  - id: zsh
+    label: zsh
+    os: posix
+    candidates: [zsh]
+    quote: "'"
+    args: ["-l", "-i", "-c", "{{command}}"]
+
+  - id: bash
+    label: bash
+    os: posix
+    candidates: [bash]
+    quote: "'"
+    args: ["-l", "-i", "-c", "{{command}}"]
+
+  - id: fish
+    label: fish
+    os: posix
+    candidates: [fish]
+    quote: "'"
+    args: ["-l", "-i", "-c", "{{command}}"]
+
+  # No -l -i: plain sh has no interactive rc worth sourcing.
+  - id: sh
+    label: sh
+    os: posix
+    candidates: [sh]
+    quote: "'"
+    args: ["-c", "{{command}}"]
+
+  # PowerShell loads the user profile by default — do NOT add -NoProfile.
+  - id: powershell
+    label: Windows PowerShell
+    os: windows
+    candidates: [powershell.exe, powershell]
+    quote: "'"
+    args: ["-NoLogo", "-Command", "{{command}}"]
+
+  - id: pwsh
+    label: PowerShell 7 (pwsh)
+    os: windows
+    candidates: [pwsh.exe, pwsh]
+    quote: "'"
+    args: ["-NoLogo", "-Command", "{{command}}"]
+
+  - id: cmd
+    label: Command Prompt
+    os: windows
+    candidates: [cmd.exe]
+    quote: '"'
+    args: ["/c", "{{command}}"]
+
+  - id: git-bash
+    label: Git Bash
+    os: windows
+    candidates:
+      - C:\Program Files\Git\bin\bash.exe
+      - C:\Program Files\Git\usr\bin\bash.exe
+      - bash.exe
+    quote: "'"
+    args: ["-l", "-i", "-c", "{{command}}"]

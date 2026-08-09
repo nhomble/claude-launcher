@@ -17,8 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nhomble/claude-launcher/internal/catalog"
 	"github.com/nhomble/claude-launcher/internal/config"
-	"github.com/nhomble/claude-launcher/internal/models"
 	"github.com/nhomble/claude-launcher/internal/nodes"
 	"github.com/nhomble/claude-launcher/internal/recents"
 	"github.com/nhomble/claude-launcher/internal/sessions"
@@ -31,10 +31,15 @@ type Server struct {
 	ring     *nodes.Ring
 	sessions *sessions.Manager
 	recents  *recents.Store
-	tpl      *template.Template
+	// Only for the model dropdown — /api/models and the page's first paint.
+	// Model resolution at launch time happens in the sessions manager, which
+	// holds the same store.
+	catalog *catalog.Store
+	shells  *shells.Registry
+	tpl     *template.Template
 }
 
-func New(cfg config.Config, ring *nodes.Ring, mgr *sessions.Manager) (*Server, error) {
+func New(cfg config.Config, ring *nodes.Ring, mgr *sessions.Manager, store *catalog.Store, reg *shells.Registry) (*Server, error) {
 	tpl, err := template.New("").Funcs(template.FuncMap{
 		"uptime": uptime,
 	}).ParseFS(web.Templates, "templates/*.html")
@@ -46,6 +51,8 @@ func New(cfg config.Config, ring *nodes.Ring, mgr *sessions.Manager) (*Server, e
 		ring:     ring,
 		sessions: mgr,
 		recents:  recents.New(cfg.DataDir),
+		catalog:  store,
+		shells:   reg,
 		tpl:      tpl,
 	}, nil
 }
@@ -111,7 +118,7 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 		"nodeId":   s.ring.Self().ID,
 		"platform": s.ring.Self().Platform,
 		"sessions": s.sessions.Count(),
-		"shells":   shells.IDs(),
+		"shells":   s.shells.IDs(),
 	})
 }
 
@@ -120,7 +127,7 @@ func (s *Server) apiNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) apiModels(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, models.All)
+	writeJSON(w, http.StatusOK, s.catalog.Models())
 }
 
 func (s *Server) apiShells(w http.ResponseWriter, r *http.Request) {
@@ -156,7 +163,7 @@ func (s *Server) apiMkdir(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) apiSessions(w http.ResponseWriter, r *http.Request) {
-	rows := s.allSessions()
+	rows := s.allSessions(r.Header.Get(FanoutHeader) != "")
 	if rows == nil {
 		rows = []sessions.Session{}
 	}
@@ -203,7 +210,7 @@ type pageData struct {
 	Nodes      []nodeView
 	MultiNode  bool
 	Node       string // currently targeted node id
-	Models     []models.Model
+	Models     []catalog.Model
 	Shells     []shellView
 	Recents    []string
 	DefaultDir string
@@ -232,8 +239,8 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		Nodes:     ring,
 		MultiNode: len(ring) > 1,
 		Node:      self.ID,
-		Models:    models.All,
-		Sessions:  s.allSessions(),
+		Models:    s.catalog.Models(),
+		Sessions:  s.allSessions(false),
 	}
 	data.Shells, _ = s.shellsFor(self)
 	data.Recents, _ = s.recentsFor(self)
@@ -245,7 +252,7 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 // uiSessions is the polled table fragment (the ring-wide aggregate).
 func (s *Server) uiSessions(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "sessions", pageData{
-		Sessions:  s.allSessions(),
+		Sessions:  s.allSessions(false),
 		MultiNode: len(s.ring.All()) > 1,
 	})
 }
@@ -270,7 +277,7 @@ func (s *Server) uiLaunch(w http.ResponseWriter, r *http.Request) {
 		data.Recents, _ = s.recentsFor(n)
 		data.Node = n.ID
 	}
-	data.Sessions = s.allSessions()
+	data.Sessions = s.allSessions(false)
 
 	// A failed launch must not blow away the recents datalist, so only send the
 	// OOB recents swap when we actually have a fresh list.
@@ -290,7 +297,7 @@ func (s *Server) uiKill(w http.ResponseWriter, r *http.Request) {
 	} else if err := s.removeOn(n, r.PathValue("id")); err != nil {
 		data.Err = err.Error()
 	}
-	data.Sessions = s.allSessions()
+	data.Sessions = s.allSessions(false)
 	s.render(w, "sessions-with-error", data)
 }
 
@@ -419,7 +426,7 @@ func (s *Server) Banner(port int) string {
 	b.WriteString("claude-launcher on http://0.0.0.0:" + strconv.Itoa(port))
 	b.WriteString("  (http://" + s.cfg.Host + ":" + strconv.Itoa(port) + "/)\n")
 	b.WriteString("  role: " + string(s.ring.Role()) + "  node: " + s.ring.Self().ID + "\n")
-	det := strings.Join(shells.IDs(), ", ")
+	det := strings.Join(s.shells.IDs(), ", ")
 	if det == "" {
 		det = "(NONE DETECTED)"
 	}

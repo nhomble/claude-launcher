@@ -2,7 +2,10 @@ module github.com/nhomble/claude-launcher
 
 go 1.25.0
 
-require github.com/aymanbagabas/go-pty v0.2.3
+require (
+	github.com/aymanbagabas/go-pty v0.2.3
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	github.com/creack/pty v1.1.24 // indirect
