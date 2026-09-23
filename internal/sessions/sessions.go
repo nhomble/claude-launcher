@@ -133,6 +133,13 @@ type live struct {
 	// Closed by pump() when the PTY is drained, so reap() can write the exit
 	// line and close the log knowing nothing else will touch them.
 	pumped chan struct{}
+
+	// Closed by reap() once cmd.Wait() returns, i.e. once the OS has actually
+	// reaped the process — unlike pumped, which only means the pty saw EOF
+	// (a zombie, not-yet-reaped process still responds to kill(pid, 0), so
+	// Shutdown must wait on this, not pumped, for its "is it really gone?"
+	// guarantee).
+	reaped chan struct{}
 }
 
 type Manager struct {
@@ -366,6 +373,7 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 		log:      lf,
 		answered: map[string]bool{},
 		pumped:   make(chan struct{}),
+		reaped:   make(chan struct{}),
 	}
 
 	m.mu.Lock()
@@ -505,6 +513,7 @@ func (l *live) shutGatesLocked() {
 // pump to finish, and only then write the exit line and close the log.
 func (l *live) reap() {
 	err := l.cmd.Wait()
+	close(l.reaped) // the OS has now actually reaped the process
 
 	l.mu.Lock()
 	l.exited = true
@@ -570,8 +579,15 @@ func (m *Manager) TailLog(id string) (string, bool) {
 	return string(b), true
 }
 
-// Shutdown kills every live session. Called on SIGINT/SIGTERM so a restart
-// doesn't leave orphaned `claude` processes attached to dead PTYs.
+// shutdownGrace bounds how long Shutdown waits for killGroup's SIGTERM ->
+// SIGKILL sequence to finish. Must exceed killGroup's own SIGKILL delay, or a
+// session that ignores SIGTERM (an interactive shell does) is orphaned: the
+// process exits before killGroup's deferred SIGKILL goroutine ever runs.
+const shutdownGrace = 3 * time.Second
+
+// Shutdown kills every live session and waits (bounded by shutdownGrace) for
+// each to actually exit. Called on SIGINT/SIGTERM so a restart doesn't leave
+// orphaned `claude` processes attached to dead PTYs.
 func (m *Manager) Shutdown() {
 	m.mu.Lock()
 	items := make([]*live, 0, len(m.items))
@@ -581,12 +597,30 @@ func (m *Manager) Shutdown() {
 	m.items = map[string]*live{}
 	m.mu.Unlock()
 
+	var wg sync.WaitGroup
 	for _, l := range items {
 		l.mu.Lock()
 		exited := l.exited
 		l.mu.Unlock()
-		if !exited && l.cmd.Process != nil {
-			killGroup(l.cmd.Process)
+		if exited || l.cmd.Process == nil {
+			continue
 		}
+		killGroup(l.cmd.Process)
+		wg.Add(1)
+		go func(l *live) {
+			defer wg.Done()
+			<-l.reaped
+		}(l)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownGrace):
+		log.Printf("shutdown: gave up waiting for every session to exit after %s", shutdownGrace)
 	}
 }
