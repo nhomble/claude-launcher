@@ -4,9 +4,21 @@ package sessions
 
 import (
 	"os"
+	"os/exec"
 	"syscall"
 	"time"
 )
+
+// setGroup makes cmd the leader of its own process group, so killGroup can
+// signal the whole tree. The PTY path gets this for free (go-pty starts the
+// shell with Setsid); a plain exec.Cmd — the turn runner — does not, and
+// without it killGroup's -pid signal would hit the LAUNCHER's group.
+func setGroup(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+}
 
 // killGroup terminates the PTY's whole process group. go-pty starts the shell
 // with Setsid, so the shell is a session/group leader and its pgid equals its

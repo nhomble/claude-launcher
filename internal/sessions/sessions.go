@@ -9,14 +9,29 @@
 // Because the PTY is owned by this process, sessions live and die with the
 // launcher — so the store is in-memory (no on-disk registry to go stale). The
 // actual session is still driven from claude.ai/code; we only spawn + track.
+//
+// # Ids
+//
+// A session's ID is a launcher-generated UUIDv4 that is ALSO passed to claude
+// as --session-id. One value therefore identifies the row in this store, the
+// URL path segment, the log file and claude's own transcript — which is what
+// makes remote turn submission possible (see turns.go). Ids are never reused
+// and never resolved through an OS pid, so a stale id can only ever 404.
+//
+// # Turns
+//
+// Callers can submit a prompt to a running session over the API. That runs a
+// separate `claude -p --resume <id>` process rather than typing into the PTY;
+// see turns.go for the full rationale. One consequence worth repeating: a live
+// remote-control TUI does NOT visibly refresh to show an API-submitted turn,
+// even though the turn does see (and append to) the same transcript.
 package sessions
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -59,6 +74,21 @@ type Session struct {
 	StartedAt  int64  `json:"startedAt"` // epoch ms
 	LogFile    string `json:"logFile"`
 	Status     string `json:"status"` // "running" | "stopped"
+	Host       string `json:"host"`   // os.Hostname() of the spawning node
+
+	// State is the finer-grained lifecycle used by the turn API:
+	// "starting" | "idle" | "busy" | "stopped". Status is kept alongside it
+	// because the UI's uptime helper keys off it.
+	State        string `json:"state"`
+	TurnID       string `json:"turnId,omitempty"` // the in-flight turn, when State == "busy"
+	LastOutputAt int64  `json:"lastOutputAt"`     // epoch ms of the last PTY byte; informational
+
+	// Best-effort enrichment from claude's own ~/.claude/sessions registry.
+	// ADVISORY ONLY — see registry.go. Absent fields are never an error.
+	ClaudePID    int    `json:"claudePid,omitempty"`
+	RemoteID     string `json:"remoteId,omitempty"`
+	RemoteStatus string `json:"remoteStatus,omitempty"`
+	Version      string `json:"claudeVersion,omitempty"`
 
 	// Set by the leader when aggregating the ring; empty on a node's own rows.
 	Node      string `json:"node,omitempty"`
@@ -119,17 +149,28 @@ var (
 )
 
 type live struct {
-	mu       sync.Mutex
-	session  Session
-	pty      xpty.Pty
-	cmd      *xpty.Cmd
-	log      *os.File
-	logged   int  // bytes written so far (capped to keep logs bounded)
-	exited   bool //
-	head     []byte
-	tail     []byte // rolling last tailBytes of output, kept live past logCap — see TailLog
-	answered map[string]bool
-	gateShut bool // startup window is over; stop scanning for gates
+	mu         sync.Mutex
+	session    Session
+	pty        xpty.Pty
+	cmd        *xpty.Cmd
+	log        *os.File
+	logged     int   // bytes written so far (capped to keep logs bounded)
+	exited     bool  //
+	finishedAt int64 // epoch ms the process exited; drives the tombstone sweep
+	head       []byte
+	tail       []byte // rolling last tailBytes of output, kept live past logCap — see TailLog
+	answered   map[string]bool
+	gateShut   bool // startup window is over; stop scanning for gates
+
+	ready        bool  // remote control came up (gatesDone matched) — turns are accepted
+	lastOutputAt int64 // epoch ms of the last PTY byte
+
+	// The turn state machine. `turn` is a SINGLE slot: nil means idle, and it
+	// is checked-and-set under mu in SubmitTurn, which is what guarantees a
+	// session never runs two API turns at once. See turns.go.
+	turn    *Turn
+	turns   []*Turn // ring of the last turnRingSize finished turns, oldest first
+	turnCmd *exec.Cmd
 
 	// Closed by pump() when the PTY is drained, so reap() can write the exit
 	// line and close the log knowing nothing else will touch them.
@@ -150,6 +191,9 @@ type Manager struct {
 	catalog *catalog.Store
 	shells  *shells.Registry
 	logDir  string
+
+	stopSweep chan struct{}
+	stopOnce  sync.Once
 }
 
 // logRetention bounds how long a session's log file outlives the session
@@ -159,16 +203,58 @@ type Manager struct {
 // debugging, then pruned, so data/logs doesn't grow forever across restarts.
 const logRetention = 7 * 24 * time.Hour
 
+// stoppedRetention is how long an exited session stays VISIBLE in the store
+// (as state:"stopped") before being swept out of memory. Long enough to read
+// the outcome of a session that died on its own, short enough that the table
+// doesn't accumulate tombstones. The on-disk log has its own, much longer,
+// logRetention.
+const (
+	stoppedRetention = 10 * time.Minute
+	sweepInterval    = time.Minute
+)
+
 func NewManager(cfg config.Config, store *catalog.Store, reg *shells.Registry) *Manager {
 	m := &Manager{
-		items:   map[string]*live{},
-		cfg:     cfg,
-		catalog: store,
-		shells:  reg,
-		logDir:  filepath.Join(cfg.DataDir, "logs"),
+		items:     map[string]*live{},
+		cfg:       cfg,
+		catalog:   store,
+		shells:    reg,
+		logDir:    filepath.Join(cfg.DataDir, "logs"),
+		stopSweep: make(chan struct{}),
 	}
 	m.pruneOldLogs()
+	go m.sweep()
 	return m
+}
+
+// sweep drops tombstoned (exited) sessions once they age past
+// stoppedRetention. Stopped by Shutdown so the goroutine doesn't outlive the
+// manager in tests.
+func (m *Manager) sweep() {
+	t := time.NewTicker(sweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.stopSweep:
+			return
+		case <-t.C:
+			m.sweepNow()
+		}
+	}
+}
+
+func (m *Manager) sweepNow() {
+	cutoff := time.Now().Add(-stoppedRetention).UnixMilli()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, l := range m.items {
+		l.mu.Lock()
+		drop := l.exited && l.finishedAt > 0 && l.finishedAt < cutoff
+		l.mu.Unlock()
+		if drop {
+			delete(m.items, id)
+		}
+	}
 }
 
 // pruneOldLogs removes log files older than logRetention. Best-effort: a
@@ -195,7 +281,9 @@ func (m *Manager) pruneOldLogs() {
 	}
 }
 
-func (m *Manager) List() []Session {
+// List returns every session this node owns, newest first. runningOnly drops
+// the stopped tombstones (what /api/sessions?running=1 asks for).
+func (m *Manager) List(runningOnly bool) []Session {
 	// Collect the pointers under m.mu, snapshot after releasing it: taking
 	// l.mu while holding m.mu would let one slow session block every caller.
 	m.mu.RLock()
@@ -207,7 +295,11 @@ func (m *Manager) List() []Session {
 
 	out := make([]Session, 0, len(items))
 	for _, l := range items {
-		out = append(out, l.snapshot())
+		s := l.snapshot()
+		if runningOnly && s.State == "stopped" {
+			continue
+		}
+		out = append(out, s)
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt > out[j].StartedAt })
@@ -222,11 +314,31 @@ func (m *Manager) Count() int {
 
 func (l *live) snapshot() Session {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	s := l.session
 	s.Status = "running"
-	if l.exited {
-		s.Status = "stopped"
+	s.LastOutputAt = l.lastOutputAt
+	switch {
+	case l.exited:
+		s.Status, s.State = "stopped", "stopped"
+	case l.turn != nil:
+		s.State = "busy"
+		s.TurnID = l.turn.ID
+	case !l.ready && time.Since(time.UnixMilli(s.StartedAt)) < gateWindow:
+		s.State = "starting"
+	default:
+		s.State = "idle"
+	}
+	l.mu.Unlock()
+
+	// Advisory enrichment, done OUTSIDE l.mu because it touches the
+	// filesystem. Never gates anything; a miss just leaves the fields empty.
+	if s.State != "stopped" {
+		if e, ok := registryEntry(s.ID); ok {
+			s.ClaudePID = e.PID
+			s.RemoteID = e.BridgeSessionID
+			s.RemoteStatus = e.Status
+			s.Version = e.Version
+		}
 	}
 	return s
 }
@@ -253,14 +365,6 @@ func defaultName(dir string) string {
 		return n
 	}
 	return "session"
-}
-
-func newID() string {
-	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%08x", time.Now().UnixNano()&0xffffffff)
-	}
-	return hex.EncodeToString(b)
 }
 
 // Variables that identify a Claude Code session. If the launcher itself was
@@ -305,6 +409,17 @@ func sessionEnv() (env []string, dropped []string) {
 	return env, dropped
 }
 
+// hostname is the spawning machine's name, recorded on every session so a
+// ring-wide listing says which physical box a session lives on even if the
+// node ids are opaque. Resolved once; a failure just leaves it empty.
+var hostname = sync.OnceValue(func() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return h
+})
+
 // uptime renders how long a session ran, for the lifecycle log lines.
 func uptime(startedAt int64) string {
 	return time.Since(time.UnixMilli(startedAt)).Round(time.Second).String()
@@ -340,7 +455,7 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 		return Session{}, err
 	}
 
-	id := newID()
+	id := newUUID()
 	name := sanitizeName(opts.Name)
 	if name == "" {
 		name = defaultName(dir)
@@ -354,8 +469,12 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 	if strings.Contains(name, " ") {
 		q = sh.Quote
 	}
-	command := fmt.Sprintf("%s --model %s%s%s --remote-control %s%s%s",
-		m.cfg.ClaudeBin, sh.Quote, model.ID, sh.Quote, q, name, q)
+	// --session-id pre-assigns claude's own session/transcript id so it equals
+	// the launcher's id. That is what lets a later `claude -p --resume <id>`
+	// turn talk to this exact session (see turns.go). Verified live against
+	// 2.1.280 that --session-id and --remote-control combine cleanly.
+	command := fmt.Sprintf("%s --session-id %s --model %s%s%s --remote-control %s%s%s",
+		m.cfg.ClaudeBin, id, sh.Quote, model.ID, sh.Quote, q, name, q)
 
 	if err := os.MkdirAll(m.logDir, 0o755); err != nil {
 		return Session{}, fmt.Errorf("cannot create log dir: %w", err)
@@ -401,6 +520,7 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 			PID:        cmd.Process.Pid, // the shell's pid; often shared with claude's via exec (see kill_unix.go), never guaranteed to be
 			StartedAt:  time.Now().UnixMilli(),
 			LogFile:    logFile,
+			Host:       hostname(),
 		},
 		pty:      p,
 		cmd:      cmd,
@@ -446,6 +566,7 @@ func (l *live) pump() {
 // log while a session runs, and reap() waits for pump() before touching it.
 func (l *live) onData(data []byte) {
 	l.mu.Lock()
+	l.lastOutputAt = time.Now().UnixMilli()
 	write := l.logged < logCap
 	if write {
 		l.logged += len(data)
@@ -528,8 +649,11 @@ func (l *live) scanGatesLocked(data []byte) []gateHit {
 				hits = append(hits, gateHit{p.ID, p.Send})
 			}
 		}
-		// Remote control coming up is the positive signal that startup is over.
+		// Remote control coming up is the positive signal that startup is over
+		// — and the same signal the turn API uses to decide the session is
+		// past onboarding and safe to resume (see SubmitTurn's ErrStarting).
 		if gatesDone.Match(l.head) {
+			l.ready = true
 			l.shutGatesLocked()
 		}
 		return hits
@@ -558,6 +682,10 @@ func (l *live) reap() {
 
 	l.mu.Lock()
 	l.exited = true
+	l.finishedAt = time.Now().UnixMilli()
+	// A turn outliving its session would keep writing to a transcript nobody
+	// is attached to any more.
+	l.killTurnLocked()
 	code := 0
 	if l.cmd.ProcessState != nil {
 		code = l.cmd.ProcessState.ExitCode()
@@ -589,6 +717,7 @@ func (m *Manager) Remove(id string) bool {
 
 	l.mu.Lock()
 	exited := l.exited
+	l.killTurnLocked() // an in-flight turn must not survive its session
 	l.mu.Unlock()
 	if !exited && l.cmd.Process != nil {
 		// Kill the whole process group: the PTY runs a login shell which in
@@ -626,6 +755,8 @@ const shutdownGrace = 3 * time.Second
 // each to actually exit. Called on SIGINT/SIGTERM so a restart doesn't leave
 // orphaned `claude` processes attached to dead PTYs.
 func (m *Manager) Shutdown() {
+	m.stopOnce.Do(func() { close(m.stopSweep) })
+
 	m.mu.Lock()
 	items := make([]*live, 0, len(m.items))
 	for _, l := range m.items {
@@ -638,6 +769,7 @@ func (m *Manager) Shutdown() {
 	for _, l := range items {
 		l.mu.Lock()
 		exited := l.exited
+		l.killTurnLocked()
 		l.mu.Unlock()
 		if exited || l.cmd.Process == nil {
 			continue
