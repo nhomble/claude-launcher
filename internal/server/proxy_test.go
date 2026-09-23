@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,5 +50,33 @@ func TestGetJSONHonorsTimeout(t *testing.T) {
 	}
 	if elapsed > time.Second {
 		t.Errorf("getJSON took %s to time out with a 200ms deadline", elapsed)
+	}
+}
+
+// An oversized body used to be silently truncated (io.LimitReader with the
+// error dropped), so the follower got a mangled JSON payload and returned a
+// confusing "invalid JSON body" 400 instead of the leader rejecting it
+// outright.
+func TestProxyRejectsOversizedBodyInsteadOfTruncating(t *testing.T) {
+	followerHit := false
+	follower := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		followerHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer follower.Close()
+
+	n := nodes.Node{ID: "big", URL: follower.URL}
+
+	big := bytes.Repeat([]byte("a"), (1<<20)+1)
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions", strings.NewReader(string(big)))
+	rec := httptest.NewRecorder()
+
+	proxy(rec, req, n)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("proxy(oversized body) status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+	if followerHit {
+		t.Error("proxy forwarded an oversized body to the follower instead of rejecting it")
 	}
 }

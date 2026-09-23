@@ -53,7 +53,20 @@ func proxy(w http.ResponseWriter, r *http.Request, n nodes.Node) {
 
 	var body io.Reader
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		const maxProxyBody = 1 << 20
+		// Read one byte past the limit so a body that's exactly at the edge
+		// vs. one that overflows it are distinguishable — silently forwarding
+		// a truncated body used to produce a confusing "invalid JSON" 400
+		// from the follower instead of a clear error from the leader.
+		b, err := io.ReadAll(io.LimitReader(r.Body, maxProxyBody+1))
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, errBody("reading request body: "+err.Error()))
+			return
+		}
+		if len(b) > maxProxyBody {
+			writeJSON(w, http.StatusRequestEntityTooLarge, errBody(fmt.Sprintf("request body exceeds %d bytes", maxProxyBody)))
+			return
+		}
 		body = bytes.NewReader(b)
 	}
 
