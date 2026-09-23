@@ -42,6 +42,9 @@ const (
 	// long. After that the scanner shuts off for good.
 	gateWindow      = 90 * time.Second
 	gateWindowBytes = 64 * 1024
+
+	// Delay between spotting a gate and sending its keystroke — see onData.
+	gateAnswerDelay = 250 * time.Millisecond
 )
 
 type Session struct {
@@ -68,11 +71,20 @@ type Session struct {
 // Nobody can answer them (the only input path is remote control, which isn't up
 // yet), so the session deadlocks and exits. Since the launcher operator
 // deliberately picks the directory + model, we auto-answer each known gate once
-// on their behalf. Match against ANSI-stripped output (the TUI wraps each word
-// in its own colour escape, so phrases aren't contiguous in the raw stream).
+// on their behalf.
+//
+// Match against ANSI-stripped output. Each row of these dialogs is drawn by
+// jumping the cursor to an absolute column between words (CSI ...G), not by
+// printing literal spaces — stripping the escapes then leaves words directly
+// concatenated ("Isthisaprojectyoucreatedoroneyoutrust?"), confirmed live
+// against claude 2.1.280. So every pattern here uses `\s*` between words
+// instead of a literal space, matching both the concatenated form and any
+// future rendering that does use real spaces.
 //
 // To add a gate: append an entry — Send is the key sequence to emit
-// ("\r" = Enter / confirm the highlighted default, "\x1b" = Esc / cancel).
+// ("\r" = Enter / confirm the highlighted default, "\x1b" = Esc / cancel,
+// "\x1b[B\r" = Down then Enter, for a dialog whose default focus is the
+// OTHER (cancel) option).
 var (
 	stripANSI = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07`)
 
@@ -81,15 +93,24 @@ var (
 		Match *regexp.Regexp
 		Send  string
 	}{
-		// Default highlighted: "Yes, I trust this folder" → Enter confirms trust.
-		{"folder-trust", regexp.MustCompile(`(?i)trust this folder|is this a project you (created|trust)`), "\r"},
-		// Default highlighted: "Yes, use my browser" → Enter turns browser tools on.
-		{"chrome-extension", regexp.MustCompile(`(?i)chrome extension detected|use my browser`), "\r"},
+		// Confirmed live against 2.1.280: this dialog's default-focused option
+		// is "No, exit" (a blue ❯ marker on that line), NOT "Yes, I trust this
+		// folder" — a bare Enter exits the session before remote control ever
+		// comes up. Down selects the other (Yes) option; Enter confirms it.
+		{"folder-trust", regexp.MustCompile(`(?i)trust\s*this\s*folder|is\s*this\s*a\s*project\s*you\s*(created|trust)`), "\x1b[B\r"},
+		// Not independently live-verified (couldn't trigger the Chrome-detected
+		// dialog in a headless test environment), but it is the same dialog
+		// component family as folder-trust (cancel-first render, per a static
+		// string dump of the 2.1.280 binary) — assumed to share its
+		// cancel-focused default until confirmed otherwise.
+		{"chrome-extension", regexp.MustCompile(`(?i)chrome\s*extension\s*detected|use\s*my\s*browser`), "\x1b[B\r"},
 		// Default highlighted: "Yes, try it" — but a headless PTY must NOT switch to
 		// the fullscreen / alternate-screen renderer: it repaints over the captured
 		// log and can stall the remote-control handshake. Esc = "Not now", keeping
-		// the plain line-based renderer the launcher relies on.
-		{"fullscreen-renderer", regexp.MustCompile(`(?i)try the new fullscreen renderer`), "\x1b"},
+		// the plain line-based renderer the launcher relies on. Esc cancels
+		// regardless of which option has focus, so this one is unaffected by the
+		// default-focus bug above.
+		{"fullscreen-renderer", regexp.MustCompile(`(?i)try\s*the\s*new\s*fullscreen\s*renderer`), "\x1b"},
 	}
 
 	// Remote control is up: onboarding is definitively over, so the gates can
@@ -398,12 +419,29 @@ func (l *live) onData(data []byte) {
 		l.log.WriteString("\n…[log capped]…\n")
 	}
 	for _, p := range gates {
-		// One keystroke; it cannot realistically fill the PTY's input buffer,
-		// which matters because pump() (this goroutine) is its only reader.
-		if _, err := l.pty.Write([]byte(p.send)); err == nil {
-			fmt.Fprintf(l.log, "\n[claude-launcher: auto-answered %s prompt]\n", p.id)
-			log.Printf("session %s auto-answered the %s prompt", l.session.ID, p.id)
-		}
+		p := p
+		// Answering is delayed, not immediate: these dialogs briefly refuse
+		// input right after they open (observed as a real risk, though not
+		// pinned down to an exact window live), and a keystroke sent in the
+		// very same PTY chunk that first rendered the prompt risks landing
+		// inside that window and being silently dropped — with l.answered
+		// already marking the gate handled, nothing would retry it. The
+		// delay runs off pump()'s goroutine so draining the PTY is never
+		// blocked by it.
+		time.AfterFunc(gateAnswerDelay, func() {
+			l.mu.Lock()
+			exited := l.exited
+			l.mu.Unlock()
+			if exited {
+				return // reap() has already closed the pty/log; nothing to answer
+			}
+			// One keystroke; it cannot realistically fill the PTY's input
+			// buffer, which matters because pump() is its only reader.
+			if _, err := l.pty.Write([]byte(p.send)); err == nil {
+				fmt.Fprintf(l.log, "\n[claude-launcher: auto-answered %s prompt]\n", p.id)
+				log.Printf("session %s auto-answered the %s prompt", l.session.ID, p.id)
+			}
+		})
 	}
 }
 
