@@ -81,6 +81,16 @@ With one node the host picker stays hidden.
 **There is no auth.** Anyone who reaches the port can spawn a shell on the host.
 Bind it to a private network — a tailnet, a VPN, localhost. Never the internet.
 
+Turn submission (below) widens this further: a caller can hand ANY existing
+session an arbitrary prompt with `permissionMode: "bypassPermissions"`, which
+is one HTTP request away from arbitrary command execution as the launcher
+user, billed to whatever account is logged in — no claude.ai login needed for
+that part, since the session is already authenticated. Deliberately left
+unrestricted (no allowlist trimming, no per-turn cost ceiling) since this is
+meant for a private tailnet between machines you own, not a shared or
+internet-facing deployment. If that ever changes, gate `permissionMode` and
+add a default `maxBudgetUsd` before opening the port any wider.
+
 ## API
 
 `GET /healthz` · `/api/nodes` · `/api/shells` · `/api/models` · `/api/config` ·
