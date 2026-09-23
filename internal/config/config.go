@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Role string
@@ -31,6 +32,10 @@ type Config struct {
 	NodeID        string // stable routing key, unique in the ring
 	NodeLabel     string // pretty name shown in the UI
 	FollowersSpec string // raw `id|label|url,…`; parsed in package nodes
+
+	// TurnTimeout bounds one API-submitted turn (a `claude -p --resume`
+	// process). A turn that hits it is killed and reported as state:"timeout".
+	TurnTimeout time.Duration
 }
 
 // Load reads .env (working directory first, then alongside the executable) and
@@ -61,6 +66,7 @@ func Load() Config {
 		NodeID:        env("CLAUDE_LAUNCHER_NODE_ID", "local"),
 		NodeLabel:     env("CLAUDE_LAUNCHER_NODE_LABEL", ""),
 		FollowersSpec: env("CLAUDE_LAUNCHER_FOLLOWERS", ""),
+		TurnTimeout:   envDuration("CLAUDE_LAUNCHER_TURN_TIMEOUT", 15*time.Minute),
 	}
 }
 
@@ -128,6 +134,22 @@ func loadDotEnv(path string) {
 func env(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
+	}
+	return def
+}
+
+// envDuration accepts a Go duration ("15m", "90s"); a bare number is read as
+// seconds so "900" also works.
+func envDuration(key string, def time.Duration) time.Duration {
+	v := env(key, "")
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
 	}
 	return def
 }

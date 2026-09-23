@@ -81,10 +81,86 @@ With one node the host picker stays hidden.
 **There is no auth.** Anyone who reaches the port can spawn a shell on the host.
 Bind it to a private network — a tailnet, a VPN, localhost. Never the internet.
 
+Turn submission (below) widens this further: a caller can hand ANY existing
+session an arbitrary prompt with `permissionMode: "bypassPermissions"`, which
+is one HTTP request away from arbitrary command execution as the launcher
+user, billed to whatever account is logged in — no claude.ai login needed for
+that part, since the session is already authenticated. Deliberately left
+unrestricted (no allowlist trimming, no per-turn cost ceiling) since this is
+meant for a private tailnet between machines you own, not a shared or
+internet-facing deployment. If that ever changes, gate `permissionMode` and
+add a default `maxBudgetUsd` before opening the port any wider.
+
 ## API
 
 `GET /healthz` · `/api/nodes` · `/api/shells` · `/api/models` · `/api/config` ·
 `/api/browse?path=` · `POST /api/mkdir` · `GET|POST /api/sessions` ·
-`DELETE /api/sessions/{id}` · `GET /api/sessions/{id}/log`
+`GET|DELETE /api/sessions/{id}` · `GET /api/sessions/{id}/log`
 
 Host-specific routes take `?node=<id>`. `/ui/*` serves the htmx fragments.
+
+`GET /api/sessions?running=1` drops stopped rows. A stopped session stays
+listed for 10 minutes so you can see how it ended, then is swept from memory.
+
+## Turns — submitting work to a session over the API
+
+A session id is a **UUID**, and it is also the id `claude` itself uses: the
+launcher passes it as `--session-id` at spawn. That makes a session
+addressable, so any caller — typically another Claude Code instance on another
+machine — can hand it a prompt and collect the answer.
+
+```sh
+# 1. find a session (no ?node= needed: the leader resolves the owner)
+curl -s localhost:8922/api/sessions?running=1
+
+# 2. submit a turn → 202 with a turn id
+curl -s -XPOST localhost:8922/api/sessions/$SID/turns \
+     -d '{"prompt":"run the iOS build and report failures"}'
+
+# 3. long-poll for the result (up to 60s per call; repeat until state != running)
+curl -s "localhost:8922/api/sessions/$SID/turns/$TID?wait=60"
+```
+
+| Route | |
+|---|---|
+| `POST /api/sessions/{id}/turns` | body `{prompt, permissionMode?, timeoutSec?, maxBudgetUsd?}` → `202` turn |
+| `GET /api/sessions/{id}/turns/{tid}?wait=30` | `200` turn; long-polls up to `wait` seconds (cap 60) |
+| `GET /api/sessions/{id}/turns` | `200` turns, newest first (last 20 plus any in flight) |
+| `DELETE /api/sessions/{id}/turns/{tid}` | `200` turn `state:"killed"`; `409` if it already finished |
+
+A turn ends in `state` `done`, `error`, `timeout` or `killed`. `done` carries
+`result`, `numTurns`, `durationMs`, `costUsd`; the others carry `error`.
+
+Rejections are explicit, so a caller never has to guess:
+
+| | |
+|---|---|
+| `409` `state:"busy"` | a turn is already running; the body carries it, so poll that instead. **Turns are never queued** — a queued prompt would run against context the caller couldn't see |
+| `409` `state:"starting"` | the session hasn't finished coming up |
+| `409` `remoteStatus` | a human appears to be driving the session right now (advisory) |
+| `410` `state:"stopped"` | the session is dead; stop retrying |
+
+All four carry `Retry-After` where retrying makes sense.
+
+### How it works, and what that costs you
+
+A turn does **not** type into the session's terminal. The launcher runs a
+separate, short-lived `claude -p --resume <id> --output-format json` process in
+the session's directory, with the prompt on stdin. Verified against claude
+2.1.280: this works while the interactive `--remote-control` process is live
+and connected, appends linearly to the same transcript, and leaves that process
+healthy.
+
+Two things to know:
+
+- **The live TUI does not refresh** to show an API-submitted turn — it's a
+  separate process and doesn't watch the transcript file. Resume or restart the
+  session to see it. The turn itself *does* see everything already in the
+  transcript.
+- A human typing into the TUI at the *same instant* an API turn runs has not
+  been verified. Nothing can corrupt on the launcher's side (it never writes to
+  the terminal, and one session runs at most one API turn at a time), but the
+  interleaving in claude's own transcript is untested.
+
+`CLAUDE_LAUNCHER_TURN_TIMEOUT` (default `15m`) bounds a turn; `timeoutSec` in
+the request overrides it, capped at 60 minutes.
