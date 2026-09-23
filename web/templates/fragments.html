@@ -38,6 +38,17 @@
     </select>
   </div>
 
+  <div>
+    <label for="model">Model</label>
+    <select id="model" name="model">
+      {{if .Models}}
+        {{range .Models}}<option value="{{.ID}}"{{if .Default}} selected{{end}}>{{.Label}}</option>{{end}}
+      {{else}}
+        <option value="">no models available</option>
+      {{end}}
+    </select>
+  </div>
+
   {{/* hx-target/hx-swap are inherited by every control the browser fragment
        renders, so navigation just re-fills this container. */}}
   <div id="browser" class="browser" hx-target="#browser" hx-swap="innerHTML"></div>

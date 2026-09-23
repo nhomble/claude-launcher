@@ -38,12 +38,6 @@
     {{template "host-panel" .}}
 
     <div>
-      <label for="model">Model</label>
-      <select id="model" name="model">
-        {{range .Models}}<option value="{{.ID}}"{{if .Default}} selected{{end}}>{{.Label}}</option>{{end}}
-      </select>
-    </div>
-    <div>
       <label for="sname">Name <span class="muted">(optional)</span></label>
       <input id="sname" name="name" placeholder="auto from folder" autocomplete="off">
     </div>

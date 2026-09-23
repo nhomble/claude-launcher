@@ -66,7 +66,7 @@ func (s *Server) Handler() http.Handler {
 
 	// ── JSON API ───────────────────────────────────────────────────────────
 	mux.HandleFunc("GET /api/nodes", s.apiNodes)
-	mux.HandleFunc("GET /api/models", s.apiModels)
+	mux.HandleFunc("GET /api/models", s.routed(s.apiModels))
 	mux.HandleFunc("GET /api/shells", s.routed(s.apiShells))
 	mux.HandleFunc("GET /api/config", s.routed(s.apiConfig))
 	mux.HandleFunc("GET /api/browse", s.routed(s.apiBrowse))
@@ -313,6 +313,10 @@ func (s *Server) uiHost(w http.ResponseWriter, r *http.Request) {
 	data := pageData{Node: n.ID, MultiNode: len(s.ring.All()) > 1}
 	data.Shells, err = s.shellsFor(n)
 	if err != nil {
+		data.Err = "node " + n.ID + " unreachable: " + err.Error()
+	}
+	data.Models, err = s.modelsFor(n)
+	if err != nil && data.Err == "" {
 		data.Err = "node " + n.ID + " unreachable: " + err.Error()
 	}
 	data.Recents, _ = s.recentsFor(n)
