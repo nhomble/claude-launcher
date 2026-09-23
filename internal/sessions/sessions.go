@@ -281,9 +281,9 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 	}
 
 	// Only quote the name when needed — keeps cmd.exe happy for the common
-	// no-space case. The model id is ALWAYS quoted: ids like
-	// `claude-opus-4-8[1m]` contain brackets that bash/PowerShell would
-	// otherwise treat as globs.
+	// no-space case. The model id is ALWAYS quoted: some ids contain
+	// shell-special characters (e.g. older `[1m]`-suffixed variants) that
+	// bash/PowerShell would otherwise treat as globs.
 	q := ""
 	if strings.Contains(name, " ") {
 		q = sh.Quote

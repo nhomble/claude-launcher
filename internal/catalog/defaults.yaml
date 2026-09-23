@@ -11,18 +11,18 @@
 # costs you a running session. A parse error keeps the last good version.
 
 # Offered in the UI's Model dropdown. Each id is passed to `claude --model <id>`
-# verbatim (and always quoted, since ids like `claude-opus-4-8[1m]` contain
-# shell-special brackets). Exactly one entry may set `default: true`; it is
-# pre-selected in the UI and used when a launch request omits a model. Without
-# one, the first entry wins.
+# verbatim (and always quoted, since some ids contain shell-special
+# characters, e.g. older `[1m]` context-window suffixes). Exactly one entry
+# may set `default: true`; it is pre-selected in the UI and used when a
+# launch request omits a model. Without one, the first entry wins.
 models:
-  - id: claude-opus-4-8[1m]
-    label: Opus 4.8 · 1M context
+  - id: claude-opus-5
+    label: Opus 5
     default: true
-  - id: claude-opus-4-8
-    label: Opus 4.8
-  - id: claude-sonnet-4-6
-    label: Sonnet 4.6
+  - id: claude-sonnet-5
+    label: Sonnet 5
+  - id: claude-fable-5-1
+    label: Fable 5.1
   - id: claude-haiku-4-5-20251001
     label: Haiku 4.5
 
