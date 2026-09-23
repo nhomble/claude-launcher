@@ -105,7 +105,7 @@
     <tr>
       <th>Name</th>
       {{if .MultiNode}}<th>Host</th>{{end}}
-      <th>Directory</th><th>Shell</th><th>Model</th><th>PID</th><th>Uptime</th><th></th>
+      <th>Session</th><th>Directory</th><th>Shell</th><th>Model</th><th>PID</th><th>State</th><th>Uptime</th><th></th>
     </tr>
   </thead>
   <tbody>
@@ -113,10 +113,12 @@
     <tr>
       <td><span class="dot {{.Status}}"></span>{{.Name}}</td>
       {{if $.MultiNode}}<td class="muted">{{with .NodeLabel}}{{.}}{{else}}—{{end}}</td>{{end}}
+      <td class="muted"><code title="{{.ID}}">{{short .ID}}</code></td>
       <td><code>{{.Dir}}</code></td>
       <td>{{.ShellLabel}}</td>
       <td class="muted">{{with .ModelLabel}}{{.}}{{else}}—{{end}}</td>
       <td class="muted">{{.PID}}</td>
+      <td class="muted">{{with .State}}{{.}}{{else}}—{{end}}</td>
       <td class="muted">{{uptime .StartedAt .Status}}</td>
       <td>
         <button type="button" class="ghost"

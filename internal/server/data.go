@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/nhomble/claude-launcher/internal/browse"
 	"github.com/nhomble/claude-launcher/internal/catalog"
@@ -128,18 +129,24 @@ func (s *Server) removeOn(n nodes.Node, id string) error {
 // omitted — never cached, never stalls the table.
 //
 // fannedOut says this request is itself a peer's fan-out, in which case we
-// answer with local sessions only (see FanoutHeader).
-func (s *Server) allSessions(fannedOut bool) []sessions.Session {
+// answer with local sessions only (see FanoutHeader). runningOnly drops
+// stopped tombstones, on this node and on every follower alike.
+func (s *Server) allSessions(fannedOut, runningOnly bool) []sessions.Session {
 	all := s.ring.All()
 	if fannedOut {
 		all = all[:1] // self only
 	}
 	rows := make([][]sessions.Session, len(all))
 
+	q := url.Values{}
+	if runningOnly {
+		q.Set("running", "1")
+	}
+
 	var wg sync.WaitGroup
 	for i, n := range all {
 		if n.Self {
-			local := s.sessions.List()
+			local := s.sessions.List(runningOnly)
 			for j := range local {
 				local[j].Node = n.ID
 				local[j].NodeLabel = n.Label
@@ -151,7 +158,7 @@ func (s *Server) allSessions(fannedOut bool) []sessions.Session {
 		go func(i int, n nodes.Node) {
 			defer wg.Done()
 			var remote []sessions.Session
-			if err := getJSON(n, "/api/sessions", nil, &remote, fanoutTimeout, [2]string{FanoutHeader, "1"}); err != nil {
+			if err := getJSON(n, "/api/sessions", q, &remote, fanoutTimeout, [2]string{FanoutHeader, "1"}); err != nil {
 				return
 			}
 			for j := range remote {
@@ -175,6 +182,56 @@ func (s *Server) allSessions(fannedOut bool) []sessions.Session {
 	}
 	return out
 }
+
+// ── session ownership resolution ─────────────────────────────────────────────
+
+// locateTTL bounds how long an id→node mapping is trusted. Ownership never
+// MOVES (a session lives and dies on the node that spawned it), so the only
+// thing the TTL protects against is remembering a node for an id that has
+// since been removed — and a 404 from the proxied call evicts the entry
+// immediately anyway. The cache exists so a caller polling a long-running turn
+// doesn't force a ring-wide fan-out on every single request.
+const locateTTL = 60 * time.Second
+
+type locateEntry struct {
+	node nodes.Node
+	at   time.Time
+}
+
+// locate finds which node owns a session id. Self is answered without any
+// network call; otherwise the existing fan-out (which already tags every row
+// with its owning node) does the work.
+func (s *Server) locate(id string) (nodes.Node, bool) {
+	if _, ok := s.sessions.Get(id); ok {
+		return s.ring.Self(), true
+	}
+	if len(s.ring.Followers()) == 0 {
+		return nodes.Node{}, false // nothing else to ask
+	}
+	if v, ok := s.owners.Load(id); ok {
+		e := v.(locateEntry)
+		if time.Since(e.at) < locateTTL {
+			return e.node, true
+		}
+		s.owners.Delete(id)
+	}
+	for _, row := range s.allSessions(false, false) {
+		if row.ID != id {
+			continue
+		}
+		n, ok := s.ring.Get(row.Node)
+		if !ok {
+			return nodes.Node{}, false
+		}
+		s.owners.Store(id, locateEntry{node: n, at: time.Now()})
+		return n, true
+	}
+	return nodes.Node{}, false
+}
+
+// forgetOwner drops a cached mapping — called when the owner answers 404, i.e.
+// the session is gone from the node we remembered.
+func (s *Server) forgetOwner(id string) { s.owners.Delete(id) }
 
 type nodeView struct {
 	ID       string `json:"id"`
