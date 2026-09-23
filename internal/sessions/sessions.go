@@ -175,6 +175,10 @@ var unsafeName = regexp.MustCompile(`[^A-Za-z0-9 _-]`)
 // without escaping tricks.
 func sanitizeName(raw string) string {
 	s := strings.TrimSpace(unsafeName.ReplaceAllString(raw, ""))
+	// A leading '-' would make the name parse as a flag to `claude
+	// --remote-control <name>` (which takes an optional value) instead of
+	// the session name.
+	s = strings.TrimLeft(s, "-")
 	if len(s) > 60 {
 		s = s[:60]
 	}
