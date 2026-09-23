@@ -127,6 +127,7 @@ type live struct {
 	logged   int  // bytes written so far (capped to keep logs bounded)
 	exited   bool //
 	head     []byte
+	tail     []byte // rolling last tailBytes of output, kept live past logCap — see TailLog
 	answered map[string]bool
 	gateShut bool // startup window is over; stop scanning for gates
 
@@ -417,6 +418,13 @@ func (l *live) onData(data []byte) {
 		l.logged += len(data)
 	}
 	capped := write && l.logged >= logCap
+	// Kept live regardless of the on-disk cap: TailLog serves this, not the
+	// (frozen, past logCap) file, so the UI's "recent output" view still
+	// moves once a long-running session's log has stopped growing.
+	l.tail = append(l.tail, data...)
+	if len(l.tail) > tailBytes {
+		l.tail = l.tail[len(l.tail)-tailBytes:]
+	}
 	gates := l.scanGatesLocked(data)
 	l.mu.Unlock()
 
@@ -569,14 +577,10 @@ func (m *Manager) TailLog(id string) (string, bool) {
 		return "", false
 	}
 
-	b, err := os.ReadFile(l.session.LogFile)
-	if err != nil {
-		return "", true
-	}
-	if len(b) > tailBytes {
-		b = b[len(b)-tailBytes:]
-	}
-	return string(b), true
+	l.mu.Lock()
+	tail := string(l.tail)
+	l.mu.Unlock()
+	return tail, true
 }
 
 // shutdownGrace bounds how long Shutdown waits for killGroup's SIGTERM ->
