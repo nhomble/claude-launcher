@@ -73,12 +73,18 @@ type Store struct {
 	failed string // stamp of the last file we could not load; log-once token
 }
 
+// notFailed is failed's zero-state sentinel. stampOf only ever returns ""
+// (file missing) or "<modtime>:<size>", so this value can never collide with
+// a real stamp — unlike "", which a disappeared file also stamps as, and
+// which would otherwise suppress the very first "disappeared" log line.
+const notFailed = "\x00unset"
+
 // New builds a store. path may be empty, in which case only the built-in
 // defaults are used. An unreadable or invalid file is a startup error — a
 // launcher silently running someone else's model list is worse than not
 // starting.
 func New(path string) (*Store, error) {
-	s := &Store{path: path}
+	s := &Store{path: path, failed: notFailed}
 
 	def, err := parse(defaultsYAML)
 	if err != nil {
@@ -236,7 +242,7 @@ func (s *Store) reloadIfChanged() {
 	// were reading it, `now` is already stale and we want the next request to
 	// pick the newer content up.
 	s.stamp = stampOf(s.path)
-	s.failed = ""
+	s.failed = notFailed
 	s.cur = loaded
 	s.gen++
 	log.Printf("catalog: reloaded %s (%d models, %d shells)", s.path, len(loaded.Models), len(loaded.Shells))
