@@ -55,7 +55,7 @@ type Session struct {
 	ShellLabel string `json:"shellLabel"`
 	Model      string `json:"model"` // model id passed to `claude --model`
 	ModelLabel string `json:"modelLabel"`
-	PID        int    `json:"pid"`
+	PID        int    `json:"pid"`       // the SHELL's pid (the PTY's direct child), not claude's — see Spawn
 	StartedAt  int64  `json:"startedAt"` // epoch ms
 	LogFile    string `json:"logFile"`
 	Status     string `json:"status"` // "running" | "stopped"
@@ -398,7 +398,7 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 			ShellLabel: sh.Label,
 			Model:      model.ID,
 			ModelLabel: model.Label,
-			PID:        cmd.Process.Pid,
+			PID:        cmd.Process.Pid, // the shell's pid; often shared with claude's via exec (see kill_unix.go), never guaranteed to be
 			StartedAt:  time.Now().UnixMilli(),
 			LogFile:    logFile,
 		},
