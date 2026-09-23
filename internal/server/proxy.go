@@ -14,10 +14,16 @@ import (
 
 // Follower calls are short-lived on purpose: one slow or dead node must never
 // hang the leader's UI, it should surface as a clean error instead.
+//
+// fanoutTimeout and probeTimeout in particular must stay under the UI's
+// 4s poll interval (web/templates/index.html, hx-trigger="every 4s"): a dead
+// follower is probed on every poll, in parallel across followers but
+// serially across polls, so a timeout >= the poll interval lets requests
+// pile up against it indefinitely.
 const (
 	proxyTimeout  = 5 * time.Second
-	probeTimeout  = 2500 * time.Millisecond
-	fanoutTimeout = 5 * time.Second
+	probeTimeout  = 1500 * time.Millisecond
+	fanoutTimeout = 3 * time.Second
 )
 
 // FanoutHeader marks a request as one node querying another during a
