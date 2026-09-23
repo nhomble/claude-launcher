@@ -42,6 +42,9 @@ const (
 	// long. After that the scanner shuts off for good.
 	gateWindow      = 90 * time.Second
 	gateWindowBytes = 64 * 1024
+
+	// Delay between spotting a gate and sending its keystroke — see onData.
+	gateAnswerDelay = 250 * time.Millisecond
 )
 
 type Session struct {
@@ -52,7 +55,7 @@ type Session struct {
 	ShellLabel string `json:"shellLabel"`
 	Model      string `json:"model"` // model id passed to `claude --model`
 	ModelLabel string `json:"modelLabel"`
-	PID        int    `json:"pid"`
+	PID        int    `json:"pid"`       // the SHELL's pid (the PTY's direct child), not claude's — see Spawn
 	StartedAt  int64  `json:"startedAt"` // epoch ms
 	LogFile    string `json:"logFile"`
 	Status     string `json:"status"` // "running" | "stopped"
@@ -68,11 +71,20 @@ type Session struct {
 // Nobody can answer them (the only input path is remote control, which isn't up
 // yet), so the session deadlocks and exits. Since the launcher operator
 // deliberately picks the directory + model, we auto-answer each known gate once
-// on their behalf. Match against ANSI-stripped output (the TUI wraps each word
-// in its own colour escape, so phrases aren't contiguous in the raw stream).
+// on their behalf.
+//
+// Match against ANSI-stripped output. Each row of these dialogs is drawn by
+// jumping the cursor to an absolute column between words (CSI ...G), not by
+// printing literal spaces — stripping the escapes then leaves words directly
+// concatenated ("Isthisaprojectyoucreatedoroneyoutrust?"), confirmed live
+// against claude 2.1.280. So every pattern here uses `\s*` between words
+// instead of a literal space, matching both the concatenated form and any
+// future rendering that does use real spaces.
 //
 // To add a gate: append an entry — Send is the key sequence to emit
-// ("\r" = Enter / confirm the highlighted default, "\x1b" = Esc / cancel).
+// ("\r" = Enter / confirm the highlighted default, "\x1b" = Esc / cancel,
+// "\x1b[B\r" = Down then Enter, for a dialog whose default focus is the
+// OTHER (cancel) option).
 var (
 	stripANSI = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07`)
 
@@ -81,15 +93,24 @@ var (
 		Match *regexp.Regexp
 		Send  string
 	}{
-		// Default highlighted: "Yes, I trust this folder" → Enter confirms trust.
-		{"folder-trust", regexp.MustCompile(`(?i)trust this folder|is this a project you (created|trust)`), "\r"},
-		// Default highlighted: "Yes, use my browser" → Enter turns browser tools on.
-		{"chrome-extension", regexp.MustCompile(`(?i)chrome extension detected|use my browser`), "\r"},
+		// Confirmed live against 2.1.280: this dialog's default-focused option
+		// is "No, exit" (a blue ❯ marker on that line), NOT "Yes, I trust this
+		// folder" — a bare Enter exits the session before remote control ever
+		// comes up. Down selects the other (Yes) option; Enter confirms it.
+		{"folder-trust", regexp.MustCompile(`(?i)trust\s*this\s*folder|is\s*this\s*a\s*project\s*you\s*(created|trust)`), "\x1b[B\r"},
+		// Not independently live-verified (couldn't trigger the Chrome-detected
+		// dialog in a headless test environment), but it is the same dialog
+		// component family as folder-trust (cancel-first render, per a static
+		// string dump of the 2.1.280 binary) — assumed to share its
+		// cancel-focused default until confirmed otherwise.
+		{"chrome-extension", regexp.MustCompile(`(?i)chrome\s*extension\s*detected|use\s*my\s*browser`), "\x1b[B\r"},
 		// Default highlighted: "Yes, try it" — but a headless PTY must NOT switch to
 		// the fullscreen / alternate-screen renderer: it repaints over the captured
 		// log and can stall the remote-control handshake. Esc = "Not now", keeping
-		// the plain line-based renderer the launcher relies on.
-		{"fullscreen-renderer", regexp.MustCompile(`(?i)try the new fullscreen renderer`), "\x1b"},
+		// the plain line-based renderer the launcher relies on. Esc cancels
+		// regardless of which option has focus, so this one is unaffected by the
+		// default-focus bug above.
+		{"fullscreen-renderer", regexp.MustCompile(`(?i)try\s*the\s*new\s*fullscreen\s*renderer`), "\x1b"},
 	}
 
 	// Remote control is up: onboarding is definitively over, so the gates can
@@ -106,12 +127,20 @@ type live struct {
 	logged   int  // bytes written so far (capped to keep logs bounded)
 	exited   bool //
 	head     []byte
+	tail     []byte // rolling last tailBytes of output, kept live past logCap — see TailLog
 	answered map[string]bool
 	gateShut bool // startup window is over; stop scanning for gates
 
 	// Closed by pump() when the PTY is drained, so reap() can write the exit
 	// line and close the log knowing nothing else will touch them.
 	pumped chan struct{}
+
+	// Closed by reap() once cmd.Wait() returns, i.e. once the OS has actually
+	// reaped the process — unlike pumped, which only means the pty saw EOF
+	// (a zombie, not-yet-reaped process still responds to kill(pid, 0), so
+	// Shutdown must wait on this, not pumped, for its "is it really gone?"
+	// guarantee).
+	reaped chan struct{}
 }
 
 type Manager struct {
@@ -123,13 +152,46 @@ type Manager struct {
 	logDir  string
 }
 
+// logRetention bounds how long a session's log file outlives the session
+// itself. Sessions are in-memory only (see the package doc) — a restart
+// relaunches nothing — so every log already on disk at startup belongs to a
+// session that's gone for good. Kept around briefly for post-mortem
+// debugging, then pruned, so data/logs doesn't grow forever across restarts.
+const logRetention = 7 * 24 * time.Hour
+
 func NewManager(cfg config.Config, store *catalog.Store, reg *shells.Registry) *Manager {
-	return &Manager{
+	m := &Manager{
 		items:   map[string]*live{},
 		cfg:     cfg,
 		catalog: store,
 		shells:  reg,
 		logDir:  filepath.Join(cfg.DataDir, "logs"),
+	}
+	m.pruneOldLogs()
+	return m
+}
+
+// pruneOldLogs removes log files older than logRetention. Best-effort: a
+// launcher that can't read its own log directory has bigger problems, but
+// that shouldn't block startup.
+func (m *Manager) pruneOldLogs() {
+	entries, err := os.ReadDir(m.logDir)
+	if err != nil {
+		return // typically: no logs directory yet
+	}
+	cutoff := time.Now().Add(-logRetention)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		path := filepath.Join(m.logDir, e.Name())
+		if err := os.Remove(path); err != nil {
+			log.Printf("pruning old session log %s: %v", path, err)
+		}
 	}
 }
 
@@ -175,6 +237,10 @@ var unsafeName = regexp.MustCompile(`[^A-Za-z0-9 _-]`)
 // without escaping tricks.
 func sanitizeName(raw string) string {
 	s := strings.TrimSpace(unsafeName.ReplaceAllString(raw, ""))
+	// A leading '-' would make the name parse as a flag to `claude
+	// --remote-control <name>` (which takes an optional value) instead of
+	// the session name.
+	s = strings.TrimLeft(s, "-")
 	if len(s) > 60 {
 		s = s[:60]
 	}
@@ -281,9 +347,9 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 	}
 
 	// Only quote the name when needed — keeps cmd.exe happy for the common
-	// no-space case. The model id is ALWAYS quoted: ids like
-	// `claude-opus-4-8[1m]` contain brackets that bash/PowerShell would
-	// otherwise treat as globs.
+	// no-space case. The model id is ALWAYS quoted: some ids contain
+	// shell-special characters (e.g. older `[1m]`-suffixed variants) that
+	// bash/PowerShell would otherwise treat as globs.
 	q := ""
 	if strings.Contains(name, " ") {
 		q = sh.Quote
@@ -332,7 +398,7 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 			ShellLabel: sh.Label,
 			Model:      model.ID,
 			ModelLabel: model.Label,
-			PID:        cmd.Process.Pid,
+			PID:        cmd.Process.Pid, // the shell's pid; often shared with claude's via exec (see kill_unix.go), never guaranteed to be
 			StartedAt:  time.Now().UnixMilli(),
 			LogFile:    logFile,
 		},
@@ -341,6 +407,7 @@ func (m *Manager) Spawn(opts SpawnOpts) (Session, error) {
 		log:      lf,
 		answered: map[string]bool{},
 		pumped:   make(chan struct{}),
+		reaped:   make(chan struct{}),
 	}
 
 	m.mu.Lock()
@@ -384,6 +451,13 @@ func (l *live) onData(data []byte) {
 		l.logged += len(data)
 	}
 	capped := write && l.logged >= logCap
+	// Kept live regardless of the on-disk cap: TailLog serves this, not the
+	// (frozen, past logCap) file, so the UI's "recent output" view still
+	// moves once a long-running session's log has stopped growing.
+	l.tail = append(l.tail, data...)
+	if len(l.tail) > tailBytes {
+		l.tail = l.tail[len(l.tail)-tailBytes:]
+	}
 	gates := l.scanGatesLocked(data)
 	l.mu.Unlock()
 
@@ -394,12 +468,29 @@ func (l *live) onData(data []byte) {
 		l.log.WriteString("\n…[log capped]…\n")
 	}
 	for _, p := range gates {
-		// One keystroke; it cannot realistically fill the PTY's input buffer,
-		// which matters because pump() (this goroutine) is its only reader.
-		if _, err := l.pty.Write([]byte(p.send)); err == nil {
-			fmt.Fprintf(l.log, "\n[claude-launcher: auto-answered %s prompt]\n", p.id)
-			log.Printf("session %s auto-answered the %s prompt", l.session.ID, p.id)
-		}
+		p := p
+		// Answering is delayed, not immediate: these dialogs briefly refuse
+		// input right after they open (observed as a real risk, though not
+		// pinned down to an exact window live), and a keystroke sent in the
+		// very same PTY chunk that first rendered the prompt risks landing
+		// inside that window and being silently dropped — with l.answered
+		// already marking the gate handled, nothing would retry it. The
+		// delay runs off pump()'s goroutine so draining the PTY is never
+		// blocked by it.
+		time.AfterFunc(gateAnswerDelay, func() {
+			l.mu.Lock()
+			exited := l.exited
+			l.mu.Unlock()
+			if exited {
+				return // reap() has already closed the pty/log; nothing to answer
+			}
+			// One keystroke; it cannot realistically fill the PTY's input
+			// buffer, which matters because pump() is its only reader.
+			if _, err := l.pty.Write([]byte(p.send)); err == nil {
+				fmt.Fprintf(l.log, "\n[claude-launcher: auto-answered %s prompt]\n", p.id)
+				log.Printf("session %s auto-answered the %s prompt", l.session.ID, p.id)
+			}
+		})
 	}
 }
 
@@ -463,6 +554,7 @@ func (l *live) shutGatesLocked() {
 // pump to finish, and only then write the exit line and close the log.
 func (l *live) reap() {
 	err := l.cmd.Wait()
+	close(l.reaped) // the OS has now actually reaped the process
 
 	l.mu.Lock()
 	l.exited = true
@@ -518,18 +610,21 @@ func (m *Manager) TailLog(id string) (string, bool) {
 		return "", false
 	}
 
-	b, err := os.ReadFile(l.session.LogFile)
-	if err != nil {
-		return "", true
-	}
-	if len(b) > tailBytes {
-		b = b[len(b)-tailBytes:]
-	}
-	return string(b), true
+	l.mu.Lock()
+	tail := string(l.tail)
+	l.mu.Unlock()
+	return tail, true
 }
 
-// Shutdown kills every live session. Called on SIGINT/SIGTERM so a restart
-// doesn't leave orphaned `claude` processes attached to dead PTYs.
+// shutdownGrace bounds how long Shutdown waits for killGroup's SIGTERM ->
+// SIGKILL sequence to finish. Must exceed killGroup's own SIGKILL delay, or a
+// session that ignores SIGTERM (an interactive shell does) is orphaned: the
+// process exits before killGroup's deferred SIGKILL goroutine ever runs.
+const shutdownGrace = 3 * time.Second
+
+// Shutdown kills every live session and waits (bounded by shutdownGrace) for
+// each to actually exit. Called on SIGINT/SIGTERM so a restart doesn't leave
+// orphaned `claude` processes attached to dead PTYs.
 func (m *Manager) Shutdown() {
 	m.mu.Lock()
 	items := make([]*live, 0, len(m.items))
@@ -539,12 +634,30 @@ func (m *Manager) Shutdown() {
 	m.items = map[string]*live{}
 	m.mu.Unlock()
 
+	var wg sync.WaitGroup
 	for _, l := range items {
 		l.mu.Lock()
 		exited := l.exited
 		l.mu.Unlock()
-		if !exited && l.cmd.Process != nil {
-			killGroup(l.cmd.Process)
+		if exited || l.cmd.Process == nil {
+			continue
 		}
+		killGroup(l.cmd.Process)
+		wg.Add(1)
+		go func(l *live) {
+			defer wg.Done()
+			<-l.reaped
+		}(l)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownGrace):
+		log.Printf("shutdown: gave up waiting for every session to exit after %s", shutdownGrace)
 	}
 }

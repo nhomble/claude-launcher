@@ -14,10 +14,16 @@ import (
 
 // Follower calls are short-lived on purpose: one slow or dead node must never
 // hang the leader's UI, it should surface as a clean error instead.
+//
+// fanoutTimeout and probeTimeout in particular must stay under the UI's
+// 4s poll interval (web/templates/index.html, hx-trigger="every 4s"): a dead
+// follower is probed on every poll, in parallel across followers but
+// serially across polls, so a timeout >= the poll interval lets requests
+// pile up against it indefinitely.
 const (
 	proxyTimeout  = 5 * time.Second
-	probeTimeout  = 2500 * time.Millisecond
-	fanoutTimeout = 5 * time.Second
+	probeTimeout  = 1500 * time.Millisecond
+	fanoutTimeout = 3 * time.Second
 )
 
 // FanoutHeader marks a request as one node querying another during a
@@ -47,7 +53,20 @@ func proxy(w http.ResponseWriter, r *http.Request, n nodes.Node) {
 
 	var body io.Reader
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		b, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		const maxProxyBody = 1 << 20
+		// Read one byte past the limit so a body that's exactly at the edge
+		// vs. one that overflows it are distinguishable — silently forwarding
+		// a truncated body used to produce a confusing "invalid JSON" 400
+		// from the follower instead of a clear error from the leader.
+		b, err := io.ReadAll(io.LimitReader(r.Body, maxProxyBody+1))
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, errBody("reading request body: "+err.Error()))
+			return
+		}
+		if len(b) > maxProxyBody {
+			writeJSON(w, http.StatusRequestEntityTooLarge, errBody(fmt.Sprintf("request body exceeds %d bytes", maxProxyBody)))
+			return
+		}
 		body = bytes.NewReader(b)
 	}
 

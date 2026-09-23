@@ -16,9 +16,9 @@ make build                    # ./claude-launcher
 make dist                     # dist/ for darwin, linux, windows
 ```
 
-Needs **Claude Code ≥ 2.1.51** logged in via claude.ai (`claude`, *not* an
-`ANTHROPIC_API_KEY`) on a Pro/Max/Team plan — remote control needs the full
-OAuth scope. Go ≥ 1.25 to build.
+Needs **Claude Code ≥ 2.1.51** (tested against 2.1.280) logged in via claude.ai
+(`claude`, *not* an `ANTHROPIC_API_KEY`) on a Pro/Max/Team plan — remote
+control needs the full OAuth scope. Go ≥ 1.25 to build.
 
 ## How it works
 
@@ -30,7 +30,8 @@ claude --model "<model>" --remote-control "<name>"
 
 Going *through* a shell sources its profile first (PATH, nvm, aliases), so pick
 the shell whose config the session should inherit. The model id is always
-quoted — ids like `claude-opus-4-8[1m]` contain shell-special brackets.
+quoted — some model ids contain shell-special characters (e.g. older
+`[1m]`-suffixed context-window variants).
 
 `claude --remote-control` is **interactive**: with a non-TTY stdout it drops to
 `--print` mode and exits. So sessions run in a real **pseudo-terminal** (ConPTY

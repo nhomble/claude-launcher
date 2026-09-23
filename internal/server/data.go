@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/nhomble/claude-launcher/internal/browse"
+	"github.com/nhomble/claude-launcher/internal/catalog"
 	"github.com/nhomble/claude-launcher/internal/nodes"
 	"github.com/nhomble/claude-launcher/internal/sessions"
 )
@@ -31,6 +32,20 @@ func (s *Server) shellsFor(n nodes.Node) ([]shellView, error) {
 	}
 	var out []shellView
 	err := getJSON(n, "/api/shells", nil, &out, proxyTimeout)
+	return out, err
+}
+
+// modelsFor is the model dropdown scoped to n: a follower's own catalog can
+// differ from the leader's (extra models, a plan-restricted subset), and
+// launch-time validation (sessions.Manager.Spawn) always resolves against
+// the target node's own catalog — so the dropdown must match, or the UI can
+// offer an id the target rejects, or hide one only it supports.
+func (s *Server) modelsFor(n nodes.Node) ([]catalog.Model, error) {
+	if n.Self {
+		return s.catalog.Models(), nil
+	}
+	var out []catalog.Model
+	err := getJSON(n, "/api/models", nil, &out, proxyTimeout)
 	return out, err
 }
 
