@@ -152,13 +152,46 @@ type Manager struct {
 	logDir  string
 }
 
+// logRetention bounds how long a session's log file outlives the session
+// itself. Sessions are in-memory only (see the package doc) — a restart
+// relaunches nothing — so every log already on disk at startup belongs to a
+// session that's gone for good. Kept around briefly for post-mortem
+// debugging, then pruned, so data/logs doesn't grow forever across restarts.
+const logRetention = 7 * 24 * time.Hour
+
 func NewManager(cfg config.Config, store *catalog.Store, reg *shells.Registry) *Manager {
-	return &Manager{
+	m := &Manager{
 		items:   map[string]*live{},
 		cfg:     cfg,
 		catalog: store,
 		shells:  reg,
 		logDir:  filepath.Join(cfg.DataDir, "logs"),
+	}
+	m.pruneOldLogs()
+	return m
+}
+
+// pruneOldLogs removes log files older than logRetention. Best-effort: a
+// launcher that can't read its own log directory has bigger problems, but
+// that shouldn't block startup.
+func (m *Manager) pruneOldLogs() {
+	entries, err := os.ReadDir(m.logDir)
+	if err != nil {
+		return // typically: no logs directory yet
+	}
+	cutoff := time.Now().Add(-logRetention)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		path := filepath.Join(m.logDir, e.Name())
+		if err := os.Remove(path); err != nil {
+			log.Printf("pruning old session log %s: %v", path, err)
+		}
 	}
 }
 
