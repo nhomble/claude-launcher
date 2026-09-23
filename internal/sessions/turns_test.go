@@ -2,8 +2,10 @@ package sessions
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -117,6 +119,10 @@ func newTurnTestManager(t *testing.T) *Manager {
 	if _, err := os.Stat("/bin/sh"); err != nil {
 		t.Skip("needs a POSIX shell")
 	}
+
+	// Hermetic: these tests must never read the developer's real
+	// ~/.claude/sessions registry.
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
 
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fakeshell")
@@ -295,6 +301,84 @@ func TestSubmitTurnSingleSlotUnderConcurrency(t *testing.T) {
 	if s, _ := m.Get(sess.ID); s.State != "idle" {
 		t.Errorf("after cancel session = %q, want idle", s.State)
 	}
+}
+
+// writeRegistryEntry drops a synthetic ~/.claude/sessions/<pid>.json (under
+// the test's isolated CLAUDE_CONFIG_DIR) so SubmitTurn's advisory check has
+// something to read.
+func writeRegistryEntry(t *testing.T, pid int, sessionID, status, entrypoint string) {
+	t.Helper()
+	dir := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), "sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir registry dir: %v", err)
+	}
+	entry := registryEntryData{
+		PID:        pid,
+		SessionID:  sessionID,
+		Status:     status,
+		Kind:       "interactive",
+		Entrypoint: entrypoint,
+	}
+	b, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("marshal registry entry: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, strconv.Itoa(pid)+".json"), b, 0o644); err != nil {
+		t.Fatalf("write registry entry: %v", err)
+	}
+}
+
+// A stale/live interactive registry entry reporting status:"busy" makes
+// SubmitTurn decline with ErrRemoteBusy — the review found there was no test
+// for this gating path at all.
+func TestSubmitTurnRejectsRemoteBusy(t *testing.T) {
+	m := newTurnTestManager(t)
+	sess := spawnReady(t, m)
+
+	writeRegistryEntry(t, 999901, sess.ID, "busy", "")
+
+	_, err := m.SubmitTurn(sess.ID, TurnRequest{Prompt: "hi"})
+	var remoteBusy *ErrRemoteBusy
+	if !errors.As(err, &remoteBusy) {
+		t.Fatalf("SubmitTurn = %v, want *ErrRemoteBusy", err)
+	}
+	if remoteBusy.Status != "busy" {
+		t.Errorf("ErrRemoteBusy.Status = %q, want busy", remoteBusy.Status)
+	}
+}
+
+// A registry entry that looks like this package's own `claude -p --resume`
+// turn runner (entrypoint:"sdk-cli", verified live against 2.1.280) must
+// never gate SubmitTurn — otherwise a turn killed by SIGKILL (which leaves
+// its own busy entry behind, see kill_unix.go's escalation) would lock the
+// session out of every future turn.
+func TestSubmitTurnIgnoresOwnTurnRunnerEntry(t *testing.T) {
+	m := newTurnTestManager(t)
+	sess := spawnReady(t, m)
+
+	writeRegistryEntry(t, 999902, sess.ID, "busy", "sdk-cli")
+
+	turn, err := m.SubmitTurn(sess.ID, TurnRequest{Prompt: "hi"})
+	if err != nil {
+		t.Fatalf("SubmitTurn wrongly gated on our own turn runner's registry entry: %v", err)
+	}
+	waitTurn(t, m, sess.ID, turn.ID)
+}
+
+// An unknown/future status value must fail OPEN, not closed: the registry
+// format is explicitly undocumented and version-coupled (see registry.go),
+// so only the one known-bad value ("busy") may gate a turn.
+func TestSubmitTurnAllowsUnknownRegistryStatus(t *testing.T) {
+	m := newTurnTestManager(t)
+	sess := spawnReady(t, m)
+
+	writeRegistryEntry(t, 999903, sess.ID, "compacting", "")
+
+	turn, err := m.SubmitTurn(sess.ID, TurnRequest{Prompt: "hi"})
+	if err != nil {
+		t.Fatalf("SubmitTurn wrongly gated on an unknown registry status: %v", err)
+	}
+	waitTurn(t, m, sess.ID, turn.ID)
 }
 
 func TestSubmitTurnRejectsStoppedSession(t *testing.T) {

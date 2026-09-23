@@ -20,17 +20,33 @@ import (
 // no match is never an error — callers just proceed as if nothing was found.
 //
 // Observed `status` values so far: "idle", "busy".
+//
+// A `claude -p --resume <uuid>` turn runner (this same package's own
+// SubmitTurn) writes its own entry into this directory too, carrying the
+// SAME sessionId as the interactive `--remote-control` process it resumes.
+// Verified live against 2.1.280: that entry always carries
+// entrypoint:"sdk-cli" (kind is still "interactive"), which is what
+// distinguishes it from a real human-driven TUI session.
 type registryEntryData struct {
 	PID              int    `json:"pid"`
 	SessionID        string `json:"sessionId"`
 	CWD              string `json:"cwd"`
 	Status           string `json:"status"`
 	Kind             string `json:"kind"`
+	Entrypoint       string `json:"entrypoint"`
 	Version          string `json:"version"`
 	BridgeSessionID  string `json:"bridgeSessionId"`
 	UpdatedAt        int64  `json:"updatedAt"`
 	StatusUpdatedAt  int64  `json:"statusUpdatedAt"`
 	MessagingSockPth string `json:"messagingSocketPath"`
+}
+
+// isTurnRunnerEntry reports whether a registry entry was written by this
+// package's own `claude -p --resume` turn runner rather than a real
+// interactive `--remote-control` session. Such entries are not a signal that
+// a human is driving the session and must never gate SubmitTurn.
+func (d registryEntryData) isTurnRunnerEntry() bool {
+	return d.Entrypoint == "sdk-cli"
 }
 
 // registryDir is the directory holding those files, honouring CLAUDE_CONFIG_DIR.

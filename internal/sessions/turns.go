@@ -172,10 +172,24 @@ func (m *Manager) SubmitTurn(id string, req TurnRequest) (Turn, error) {
 		timeout = maxTurnTimeout
 	}
 
-	// The advisory check happens OUTSIDE l.mu (it touches the filesystem) and
-	// before the slot claim. It can only ever add a rejection, never permit
-	// one that the slot check would refuse, so ordering here is harmless.
-	if e, ok := registryEntry(id); ok && e.Status != "" && e.Status != "idle" {
+	// The launcher's own authoritative in-memory state always takes
+	// precedence over the best-effort filesystem signal below: a stopped
+	// session must report ErrStopped (not a misleading "retry later"), and a
+	// session busy with our OWN in-flight turn must return that turn so the
+	// caller can poll it.
+	if err := l.peekTurnGate(); err != nil {
+		return Turn{}, err
+	}
+
+	// The advisory check happens OUTSIDE l.mu (it touches the filesystem),
+	// and only after the launcher's own state says the session is otherwise
+	// available for a turn. It can only ever add a rejection on top of that,
+	// never override a rejection the slot check already made. Skip entries
+	// written by this package's own `claude -p --resume` turn runner: they
+	// carry the same sessionId as the interactive session but are not a
+	// human driving the TUI, so they must never gate SubmitTurn (a killed
+	// turn runner can leave one of these behind indefinitely).
+	if e, ok := registryEntry(id); ok && e.Status == "busy" && !e.isTurnRunnerEntry() {
 		return Turn{}, &ErrRemoteBusy{Status: e.Status}
 	}
 
@@ -207,6 +221,26 @@ func (m *Manager) SubmitTurn(id string, req TurnRequest) (Turn, error) {
 
 	go l.runTurn(m, t, req, dir, model, timeout)
 	return out, nil
+}
+
+// peekTurnGate re-checks the launcher's own state (the same switch
+// SubmitTurn will do again once it actually claims the slot) so the advisory
+// registry check below is skipped entirely when the launcher's own state
+// would already refuse the turn. A nil return means the session currently
+// looks available; a non-nil return is the launcher's own, authoritative
+// outcome and must be returned to the caller as-is.
+func (l *live) peekTurnGate() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	switch {
+	case l.exited:
+		return ErrStopped
+	case l.turn != nil:
+		return &ErrBusy{Turn: *l.turn}
+	case !l.ready && time.Since(time.UnixMilli(l.session.StartedAt)) < gateWindow:
+		return ErrStarting
+	}
+	return nil
 }
 
 // GetTurn returns a turn, optionally long-polling up to wait for it to finish.
