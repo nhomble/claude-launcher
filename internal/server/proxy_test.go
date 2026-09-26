@@ -71,7 +71,7 @@ func TestProxyRejectsOversizedBodyInsteadOfTruncating(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/sessions", strings.NewReader(string(big)))
 	rec := httptest.NewRecorder()
 
-	proxy(rec, req, n, proxyTimeout)
+	proxy(rec, req, n)
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("proxy(oversized body) status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)

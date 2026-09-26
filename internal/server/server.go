@@ -16,7 +16,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/nhomble/claude-launcher/internal/catalog"
@@ -39,16 +38,12 @@ type Server struct {
 	catalog *catalog.Store
 	shells  *shells.Registry
 	tpl     *template.Template
-
-	// id → owning node, with a locateTTL lifetime. See locate() in data.go.
-	owners sync.Map
 }
 
 func New(cfg config.Config, ring *nodes.Ring, mgr *sessions.Manager, store *catalog.Store, reg *shells.Registry) (*Server, error) {
 	tpl, err := template.New("").Funcs(template.FuncMap{
 		"uptime": uptime,
 		"qurl":   queryURL,
-		"short":  shortID,
 	}).ParseFS(web.Templates, "templates/*.html")
 	if err != nil {
 		return nil, err
@@ -79,13 +74,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/recents", s.routed(s.apiRecents))
 	mux.HandleFunc("GET /api/sessions", s.apiSessions)
 	mux.HandleFunc("POST /api/sessions", s.routed(s.apiSpawn))
-	mux.HandleFunc("GET /api/sessions/{id}", s.routedByID(s.apiSession))
-	mux.HandleFunc("DELETE /api/sessions/{id}", s.routedByID(s.apiKill))
-	mux.HandleFunc("GET /api/sessions/{id}/log", s.routedByID(s.apiLog))
-	mux.HandleFunc("POST /api/sessions/{id}/turns", s.routedByID(s.apiTurnSubmit))
-	mux.HandleFunc("GET /api/sessions/{id}/turns", s.routedByID(s.apiTurnList))
-	mux.HandleFunc("GET /api/sessions/{id}/turns/{tid}", s.routedByID(s.apiTurnGet))
-	mux.HandleFunc("DELETE /api/sessions/{id}/turns/{tid}", s.routedByID(s.apiTurnCancel))
+	mux.HandleFunc("DELETE /api/sessions/{id}", s.routed(s.apiKill))
+	mux.HandleFunc("GET /api/sessions/{id}/log", s.routed(s.apiLog))
 
 	// ── htmx fragments ─────────────────────────────────────────────────────
 	mux.HandleFunc("GET /ui/sessions", s.uiSessions)
@@ -114,78 +104,11 @@ func (s *Server) routed(h func(http.ResponseWriter, *http.Request)) http.Handler
 			return
 		}
 		if !n.Self {
-			proxy(w, r, n, proxyTimeout)
+			proxy(w, r, n)
 			return
 		}
 		h(w, r)
 	}
-}
-
-// routedByID routes a per-session call by the session id in the path, so a
-// caller that only knows an id — the cross-node delegation case this whole
-// turn API exists for — doesn't have to know which machine owns it.
-//
-// An explicit ?node= still wins and behaves exactly as `routed` always did,
-// so every existing caller is unaffected.
-func (s *Server) routedByID(h func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if id := r.URL.Query().Get("node"); id != "" {
-			n, ok := s.ring.Get(id)
-			if !ok {
-				writeJSON(w, http.StatusNotFound, errBody("unknown node: "+id))
-				return
-			}
-			if !n.Self {
-				proxy(w, r, n, proxyTimeout+turnWait(r))
-				return
-			}
-			h(w, r)
-			return
-		}
-
-		sid := r.PathValue("id")
-		n, ok := s.locate(sid)
-		if !ok {
-			writeJSON(w, http.StatusNotFound, errBody("not found"))
-			return
-		}
-		if n.Self {
-			h(w, r)
-			return
-		}
-		// A 404 from the node we remembered means the mapping is stale.
-		rec := &statusRecorder{ResponseWriter: w}
-		proxy(rec, r, n, proxyTimeout+turnWait(r))
-		if rec.status == http.StatusNotFound {
-			s.forgetOwner(sid)
-		}
-	}
-}
-
-// statusRecorder notes the status written through it, leaving the body
-// untouched — proxy() must still copy the follower's response verbatim.
-type statusRecorder struct {
-	http.ResponseWriter
-	status int
-}
-
-func (w *statusRecorder) WriteHeader(code int) {
-	w.status = code
-	w.ResponseWriter.WriteHeader(code)
-}
-
-// turnWait parses ?wait= (seconds) for the turn long-poll, clamped to
-// maxTurnWait. Anything else is 0.
-func turnWait(r *http.Request) time.Duration {
-	n, err := strconv.Atoi(r.URL.Query().Get("wait"))
-	if err != nil || n <= 0 {
-		return 0
-	}
-	d := time.Duration(n) * time.Second
-	if d > maxTurnWait {
-		d = maxTurnWait
-	}
-	return d
 }
 
 // ── JSON API ─────────────────────────────────────────────────────────────────
@@ -242,107 +165,11 @@ func (s *Server) apiMkdir(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) apiSessions(w http.ResponseWriter, r *http.Request) {
-	rows := s.allSessions(r.Header.Get(FanoutHeader) != "", r.URL.Query().Get("running") != "")
+	rows := s.allSessions(r.Header.Get(FanoutHeader) != "")
 	if rows == nil {
 		rows = []sessions.Session{}
 	}
 	writeJSON(w, http.StatusOK, rows)
-}
-
-func (s *Server) apiSession(w http.ResponseWriter, r *http.Request) {
-	sess, ok := s.sessions.Get(r.PathValue("id"))
-	if !ok {
-		writeJSON(w, http.StatusNotFound, errBody("not found"))
-		return
-	}
-	self := s.ring.Self()
-	sess.Node, sess.NodeLabel = self.ID, self.Label
-	writeJSON(w, http.StatusOK, sess)
-}
-
-// ── turns ────────────────────────────────────────────────────────────────────
-
-func (s *Server) apiTurnSubmit(w http.ResponseWriter, r *http.Request) {
-	var req sessions.TurnRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, errBody("invalid JSON body"))
-		return
-	}
-	turn, err := s.sessions.SubmitTurn(r.PathValue("id"), req)
-	if err != nil {
-		s.writeTurnError(w, err)
-		return
-	}
-	turn.Node = s.ring.Self().ID
-	writeJSON(w, http.StatusAccepted, turn)
-}
-
-// writeTurnError maps the manager's typed errors onto status codes. The 409s
-// all carry Retry-After because the intended caller is another Claude Code
-// instance, for which "wait and retry" is a one-line loop.
-func (s *Server) writeTurnError(w http.ResponseWriter, err error) {
-	var busy *sessions.ErrBusy
-	var remote *sessions.ErrRemoteBusy
-	var bad sessions.ErrBadRequest
-	switch {
-	case errors.Is(err, sessions.ErrNotFound):
-		writeJSON(w, http.StatusNotFound, errBody("not found"))
-	case errors.Is(err, sessions.ErrStopped):
-		writeJSON(w, http.StatusGone, map[string]any{"error": err.Error(), "state": "stopped"})
-	case errors.Is(err, sessions.ErrStarting):
-		w.Header().Set("Retry-After", "5")
-		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "state": "starting"})
-	case errors.As(err, &busy):
-		w.Header().Set("Retry-After", "5")
-		writeJSON(w, http.StatusConflict, map[string]any{"error": busy.Error(), "state": "busy", "turn": busy.Turn})
-	case errors.As(err, &remote):
-		w.Header().Set("Retry-After", "5")
-		writeJSON(w, http.StatusConflict, map[string]any{"error": remote.Error(), "state": "idle", "remoteStatus": remote.Status})
-	case errors.As(err, &bad):
-		writeJSON(w, http.StatusBadRequest, errBody(err.Error()))
-	default:
-		writeJSON(w, http.StatusInternalServerError, errBody(err.Error()))
-	}
-}
-
-func (s *Server) apiTurnGet(w http.ResponseWriter, r *http.Request) {
-	turn, ok := s.sessions.GetTurn(r.PathValue("id"), r.PathValue("tid"), turnWait(r))
-	if !ok {
-		writeJSON(w, http.StatusNotFound, errBody("not found"))
-		return
-	}
-	turn.Node = s.ring.Self().ID
-	writeJSON(w, http.StatusOK, turn)
-}
-
-func (s *Server) apiTurnList(w http.ResponseWriter, r *http.Request) {
-	turns, ok := s.sessions.ListTurns(r.PathValue("id"))
-	if !ok {
-		writeJSON(w, http.StatusNotFound, errBody("not found"))
-		return
-	}
-	self := s.ring.Self().ID
-	for i := range turns {
-		turns[i].Node = self
-	}
-	writeJSON(w, http.StatusOK, turns)
-}
-
-func (s *Server) apiTurnCancel(w http.ResponseWriter, r *http.Request) {
-	turn, err := s.sessions.CancelTurn(r.PathValue("id"), r.PathValue("tid"))
-	if err != nil {
-		var bad sessions.ErrBadRequest
-		if errors.As(err, &bad) {
-			// Already finished — hand back the outcome rather than a bare error.
-			turn.Node = s.ring.Self().ID
-			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "turn": turn})
-			return
-		}
-		writeJSON(w, http.StatusNotFound, errBody("not found"))
-		return
-	}
-	turn.Node = s.ring.Self().ID
-	writeJSON(w, http.StatusOK, turn)
 }
 
 func (s *Server) apiSpawn(w http.ResponseWriter, r *http.Request) {
@@ -415,7 +242,7 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		MultiNode: len(ring) > 1,
 		Node:      self.ID,
 		Models:    s.catalog.Models(),
-		Sessions:  s.allSessions(false, false),
+		Sessions:  s.allSessions(false),
 	}
 	data.Shells, _ = s.shellsFor(self)
 	data.Recents, _ = s.recentsFor(self)
@@ -427,7 +254,7 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 // uiSessions is the polled table fragment (the ring-wide aggregate).
 func (s *Server) uiSessions(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "sessions", pageData{
-		Sessions:  s.allSessions(false, false),
+		Sessions:  s.allSessions(false),
 		MultiNode: len(s.ring.All()) > 1,
 	})
 }
@@ -452,7 +279,7 @@ func (s *Server) uiLaunch(w http.ResponseWriter, r *http.Request) {
 		data.Recents, _ = s.recentsFor(n)
 		data.Node = n.ID
 	}
-	data.Sessions = s.allSessions(false, false)
+	data.Sessions = s.allSessions(false)
 
 	// A failed launch must not blow away the recents datalist, so only send the
 	// OOB recents swap when we actually have a fresh list.
@@ -472,7 +299,7 @@ func (s *Server) uiKill(w http.ResponseWriter, r *http.Request) {
 	} else if err := s.removeOn(n, r.PathValue("id")); err != nil {
 		data.Err = err.Error()
 	}
-	data.Sessions = s.allSessions(false, false)
+	data.Sessions = s.allSessions(false)
 	s.render(w, "sessions-with-error", data)
 }
 
@@ -595,15 +422,6 @@ func queryURL(base string, kv ...string) string {
 		return base
 	}
 	return base + "?" + q.Encode()
-}
-
-// shortID abbreviates a session UUID for DISPLAY only. Links and forms must
-// always carry the full id — it is claude's own session id too.
-func shortID(id string) string {
-	if len(id) > 8 {
-		return id[:8]
-	}
-	return id
 }
 
 // uptime renders how long a session has been up, from its epoch-ms start.
